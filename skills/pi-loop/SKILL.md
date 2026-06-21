@@ -33,7 +33,7 @@ A good spec includes:
 - `iterationPrompt`: one focused iteration, not the whole project.
 - `maxIterations`: small default, usually 3-5.
 - `trainingMode`: `true` until the loop is trusted.
-- `verificationHint`: deterministic commands/checks where possible.
+- `verificationHint`: deterministic commands/checks where possible. For coding tasks, the best completion criterion is usually a written test that proves the requested behavior and passes reliably.
 
 Default spec location:
 
@@ -61,7 +61,7 @@ Use `loop_report` statuses:
 - `not_done`: another iteration is useful; include `nextPrompt`.
 - `blocked`: human input, missing access, ambiguity, or unsafe next step.
 
-Never call `loop_report(status="done")` without verification evidence.
+Never call `loop_report(status="done")` without verification evidence. For code changes, prefer adding or updating a test first, then use that passing test as the primary proof of completion.
 
 ## Guardrails
 
