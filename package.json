@@ -1,0 +1,35 @@
+{
+  "name": "pi-loop",
+  "version": "0.1.0",
+  "description": "Pi loop engineering extension: repeat agent turns until a verifiable goal is reached.",
+  "type": "module",
+  "license": "MIT",
+  "author": "k1000",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "agent-skills",
+    "loop-engineering",
+    "automation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/k1000/pi-loop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/k1000/pi-loop/issues"
+  },
+  "homepage": "https://github.com/k1000/pi-loop#readme",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.79.9",
+    "typebox": "^1.1.38"
+  },
+  "pi": {
+    "extensions": ["./index.ts"],
+    "skills": ["./skills"]
+  }
+}
