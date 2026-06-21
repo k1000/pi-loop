@@ -1,6 +1,6 @@
 {
   "name": "pi-loop",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi loop engineering extension: repeat agent turns until a verifiable goal is reached.",
   "type": "module",
   "license": "MIT",

@@ -6,7 +6,7 @@ For coding tasks, the loop's job is simple:
 
 > Codify the expected functionality into tests, then loop until the test command passes.
 
-The agent does the work. The extension orchestrates normal Pi turns, stores loop state, asks for training-mode approvals, and runs the authoritative verifier after each `loop_report`.
+For larger features, use a **test plan**: an ordered list of test-backed steps. Pi-loop satisfies one step verifier at a time, advances only when that verifier passes, then optionally runs a final full-suite verifier.
 
 ## Install
 
@@ -47,7 +47,9 @@ The package includes a skill:
 
 Use it to design deterministic loop specs and turn expected coding functionality into test-based completion criteria.
 
-## Spec shape
+## Single-test spec
+
+Use this for small/medium tasks:
 
 ```json
 {
@@ -60,6 +62,57 @@ Use it to design deterministic loop specs and turn expected coding functionality
   "maxIterations": 5,
   "trainingMode": true
 }
+```
+
+## Test-plan spec
+
+Use this for larger features that should be decomposed into multiple tests:
+
+```json
+{
+  "name": "onboarding-feature",
+  "goal": "Implement the onboarding flow",
+  "mode": "test-plan",
+  "maxIterationsPerStep": 3,
+  "trainingMode": true,
+  "plan": [
+    {
+      "name": "creates draft applicant",
+      "taskPrompt": "Write or update the draft applicant test, then implement the smallest behavior needed for it.",
+      "verifyCommand": "npm test -- onboarding.create-draft.test.ts",
+      "doneWhen": "verifyCommand exits 0"
+    },
+    {
+      "name": "validates required fields",
+      "taskPrompt": "Write or update required-field validation tests, then implement the smallest behavior needed for them.",
+      "verifyCommand": "npm test -- onboarding.validation.test.ts",
+      "doneWhen": "verifyCommand exits 0"
+    },
+    {
+      "name": "handles approval webhook",
+      "taskPrompt": "Write or update approval webhook tests, then implement the smallest behavior needed for them.",
+      "verifyCommand": "npm test -- onboarding.webhook-approved.test.ts",
+      "doneWhen": "verifyCommand exits 0"
+    }
+  ],
+  "finalVerifyCommand": "npm test -- onboarding"
+}
+```
+
+State machine:
+
+```txt
+for each plan step:
+  agent works on current test-backed step
+  agent calls loop_report
+  extension runs step verifyCommand
+  exit 0 => advance to next step
+  nonzero => retry same step, or stop at maxIterationsPerStep
+
+then, if configured:
+  extension runs finalVerifyCommand
+  exit 0 => done
+  nonzero => queue integration/regression fix iteration
 ```
 
 ## Deterministic runtime protocol
@@ -75,15 +128,15 @@ Use it to design deterministic loop specs and turn expected coding functionality
 }
 ```
 
-Then the extension runs `verifyCommand` and decides:
+Then the extension runs the current verifier and decides:
 
 ```txt
-exit 0       => done
+exit 0       => step done / loop done
 exit nonzero => continue, or stop at maxIterations
 blocked true => blocked
 ```
 
-The agent no longer decides `done`; passing `verifyCommand` is the completion proof.
+The agent does not decide `done`; passing the current verifier is the completion proof.
 
 Run memory is written by default to:
 
@@ -95,8 +148,9 @@ Run memory is written by default to:
 
 Every loop spec has:
 
-- `verifyCommand`, the deterministic completion check.
+- `verifyCommand` or a test-backed `plan`.
 - `maxIterations`, capped internally at 50.
+- `maxIterationsPerStep` for test plans.
 - `trainingMode`; keep this `true` until the loop is trusted.
 
-For fuzzy goals, add a checker or approval gate, for example `review score >= 8/10` or `human approved`.
+For fuzzy goals, first create a test plan or add a checker/approval gate, for example `review score >= 8/10` or `human approved`.

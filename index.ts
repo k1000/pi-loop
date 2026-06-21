@@ -8,10 +8,18 @@ const LOOP_CONFIG_DIR = ".pi";
 const GLOBAL_LOOP_DIR = join(homedir(), ".pi", "agent", "loops");
 const MAX_SAFE_ITERATIONS = 50;
 const DEFAULT_VERIFY_TIMEOUT_MS = 120_000;
+const DEFAULT_ITERATIONS_PER_STEP = 3;
 
 type LoopStatus = "done" | "not_done" | "blocked";
 type RunStatus = "running" | "done" | "blocked" | "stopped" | "max_iterations";
-type LoopMode = "tdd" | "standard";
+type LoopMode = "tdd" | "standard" | "test-plan";
+
+type LoopStep = {
+  name: string;
+  taskPrompt: string;
+  verifyCommand: string;
+  doneWhen: string;
+};
 
 type LoopSpec = {
   name: string;
@@ -21,9 +29,12 @@ type LoopSpec = {
   verifyCommand: string;
   doneWhen: string;
   maxIterations: number;
+  maxIterationsPerStep: number;
   trainingMode: boolean;
   memoryPath?: string;
   verifyTimeoutMs: number;
+  plan: LoopStep[];
+  finalVerifyCommand?: string;
 };
 
 const LoopReportSchema = Type.Object({
@@ -38,6 +49,9 @@ type LoopReport = Static<typeof LoopReportSchema>;
 
 type HistoryEntry = LoopReport & {
   iteration: number;
+  stepIteration: number;
+  stepIndex?: number;
+  stepName?: string;
   timestamp: string;
   status: LoopStatus;
   verification: string;
@@ -55,6 +69,8 @@ type ActiveRun = {
   logPath: string;
   spec: LoopSpec;
   iteration: number;
+  stepIteration: number;
+  currentStepIndex: number;
   status: RunStatus;
   startedAt: string;
   updatedAt: string;
@@ -97,15 +113,27 @@ function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
+function normalizeStep(raw: unknown, index: number, fallback: Pick<LoopStep, "taskPrompt" | "verifyCommand" | "doneWhen">): LoopStep {
+  const input = (raw && typeof raw === "object" ? raw : {}) as Partial<LoopStep>;
+  const name = String(input.name || `step-${index + 1}`);
+  return {
+    name,
+    taskPrompt: String(input.taskPrompt || fallback.taskPrompt),
+    verifyCommand: String(input.verifyCommand || fallback.verifyCommand),
+    doneWhen: String(input.doneWhen || fallback.doneWhen),
+  };
+}
+
 function appendRunLog(run: ActiveRun, entry: HistoryEntry) {
   ensureDir(dirname(run.logPath));
   const artifacts = entry.artifacts?.length ? `\nArtifacts:\n${entry.artifacts.map((a) => `- ${a}`).join("\n")}` : "";
   const lessons = entry.lessonsLearned?.length ? `\nLessons:\n${entry.lessonsLearned.map((l) => `- ${l}`).join("\n")}` : "";
   const stdout = entry.verifyStdout ? `\n\nStdout:\n\`\`\`\n${entry.verifyStdout}\n\`\`\`` : "";
   const stderr = entry.verifyStderr ? `\n\nStderr:\n\`\`\`\n${entry.verifyStderr}\n\`\`\`` : "";
+  const step = entry.stepName ? ` — ${entry.stepName}` : "";
   appendFileSync(
     run.logPath,
-    `\n## Iteration ${entry.iteration} — ${entry.status} — ${entry.timestamp}\n\n${entry.summary}\n\nVerification: ${entry.verification}${artifacts}${lessons}${stdout}${stderr}\n`,
+    `\n## Iteration ${entry.iteration}.${entry.stepIteration}${step} — ${entry.status} — ${entry.timestamp}\n\n${entry.summary}\n\nVerification: ${entry.verification}${artifacts}${lessons}${stdout}${stderr}\n`,
     "utf8",
   );
 }
@@ -115,23 +143,39 @@ function normalizeSpec(raw: unknown, fallbackName: string): LoopSpec {
     iterationPrompt?: string;
     doneRule?: string;
     verificationHint?: string;
+    plan?: unknown[];
   };
   const name = sanitizeName(String(input.name || fallbackName));
+  const fallback = {
+    taskPrompt: String(input.taskPrompt || input.iterationPrompt || "Do one focused iteration toward the goal, then call loop_report."),
+    verifyCommand: String(input.verifyCommand || input.verificationHint || "npm test"),
+    doneWhen: String(input.doneWhen || input.doneRule || "verifyCommand exits 0"),
+  };
+  const plan = Array.isArray(input.plan) ? input.plan.map((step, index) => normalizeStep(step, index, fallback)) : [];
+  const mode: LoopMode = input.mode === "test-plan" || plan.length > 0 ? "test-plan" : input.mode === "standard" ? "standard" : "tdd";
+  const maxIterationsPerStep = Math.max(
+    1,
+    Math.min(MAX_SAFE_ITERATIONS, Number.isFinite(input.maxIterationsPerStep) ? Math.floor(Number(input.maxIterationsPerStep)) : DEFAULT_ITERATIONS_PER_STEP),
+  );
+  const defaultMaxIterations = mode === "test-plan" ? Math.min(MAX_SAFE_ITERATIONS, Math.max(1, plan.length || 1) * maxIterationsPerStep + (input.finalVerifyCommand ? maxIterationsPerStep : 0)) : 5;
   const maxIterations = Math.max(
     1,
-    Math.min(MAX_SAFE_ITERATIONS, Number.isFinite(input.maxIterations) ? Math.floor(Number(input.maxIterations)) : 5),
+    Math.min(MAX_SAFE_ITERATIONS, Number.isFinite(input.maxIterations) ? Math.floor(Number(input.maxIterations)) : defaultMaxIterations),
   );
   const verifyTimeoutMs = Math.max(1_000, Number.isFinite(input.verifyTimeoutMs) ? Math.floor(Number(input.verifyTimeoutMs)) : DEFAULT_VERIFY_TIMEOUT_MS);
   return {
     name,
     goal: String(input.goal || "Complete the requested task."),
-    mode: input.mode === "standard" ? "standard" : "tdd",
-    taskPrompt: String(input.taskPrompt || input.iterationPrompt || "Do one focused iteration toward the goal, then call loop_report."),
-    verifyCommand: String(input.verifyCommand || input.verificationHint || "npm test"),
-    doneWhen: String(input.doneWhen || input.doneRule || "verifyCommand exits 0"),
+    mode,
+    taskPrompt: fallback.taskPrompt,
+    verifyCommand: fallback.verifyCommand,
+    doneWhen: fallback.doneWhen,
     maxIterations,
+    maxIterationsPerStep,
     trainingMode: input.trainingMode !== false,
     verifyTimeoutMs,
+    plan,
+    ...(input.finalVerifyCommand ? { finalVerifyCommand: String(input.finalVerifyCommand) } : {}),
     ...(input.memoryPath ? { memoryPath: String(input.memoryPath) } : {}),
   };
 }
@@ -146,8 +190,10 @@ function defaultSpec(name: string): LoopSpec {
     verifyCommand: "npm test",
     doneWhen: "verifyCommand exits 0",
     maxIterations: 5,
+    maxIterationsPerStep: DEFAULT_ITERATIONS_PER_STEP,
     trainingMode: true,
     verifyTimeoutMs: DEFAULT_VERIFY_TIMEOUT_MS,
+    plan: [],
   };
 }
 
@@ -179,27 +225,59 @@ function persistRun(run: ActiveRun) {
   writeJson(run.runPath, run);
 }
 
+function isTestPlan(run: ActiveRun) {
+  return run.spec.mode === "test-plan" && run.spec.plan.length > 0;
+}
+
+function currentStep(run: ActiveRun): LoopStep {
+  if (isTestPlan(run)) return run.spec.plan[Math.min(run.currentStepIndex, run.spec.plan.length - 1)];
+  return {
+    name: "single-step",
+    taskPrompt: run.spec.taskPrompt,
+    verifyCommand: run.spec.verifyCommand,
+    doneWhen: run.spec.doneWhen,
+  };
+}
+
+function currentStepLabel(run: ActiveRun) {
+  if (!isTestPlan(run)) return "single-step";
+  return `${run.currentStepIndex + 1}/${run.spec.plan.length}: ${currentStep(run).name}`;
+}
+
 function formatHistory(run: ActiveRun) {
   if (run.history.length === 0) return "No previous iterations.";
   return run.history
     .map((entry) => {
       const next = entry.nextPrompt ? `\nNext hint: ${entry.nextPrompt}` : "";
-      return `Iteration ${entry.iteration} (${entry.status}): ${entry.summary}\nVerification: ${entry.verification}${next}`;
+      const step = entry.stepName ? ` [${entry.stepName}]` : "";
+      return `Iteration ${entry.iteration}.${entry.stepIteration}${step} (${entry.status}): ${entry.summary}\nVerification: ${entry.verification}${next}`;
     })
     .join("\n\n");
 }
 
+function formatPlan(run: ActiveRun) {
+  if (!isTestPlan(run)) return "";
+  const lines = run.spec.plan.map((step, index) => {
+    const marker = index < run.currentStepIndex ? "✓" : index === run.currentStepIndex ? "→" : "•";
+    return `${marker} ${index + 1}. ${step.name} — ${step.verifyCommand}`;
+  });
+  const final = run.spec.finalVerifyCommand ? [`Final verifier: ${run.spec.finalVerifyCommand}`] : [];
+  return `\nTest plan:\n${[...lines, ...final].join("\n")}\n`;
+}
+
 function buildIterationPrompt(run: ActiveRun, promptOverride?: string) {
-  const prompt = promptOverride?.trim() || run.spec.taskPrompt;
-  const tdd = run.spec.mode === "tdd"
-    ? "\nTDD mode:\n- First write or update a failing test that proves the requested behavior.\n- Then implement the smallest fix.\n- Completion verification is the test command passing.\n"
+  const step = currentStep(run);
+  const prompt = promptOverride?.trim() || step.taskPrompt;
+  const tdd = run.spec.mode === "tdd" || run.spec.mode === "test-plan"
+    ? "\nTDD mode:\n- Codify the expected functionality into tests.\n- For this iteration, satisfy the current test step only.\n- Completion verification is the authoritative test command passing.\n"
     : "";
-  return `You are running Pi loop \"${run.spec.name}\".\n\nGoal:\n${run.spec.goal}\n\nDone when:\n${run.spec.doneWhen}\n\nAuthoritative verifier:\n${run.spec.verifyCommand}\n\nIteration ${run.iteration} of ${run.spec.maxIterations}.\n${tdd}\nPrevious loop history:\n${formatHistory(run)}\n\nThis iteration prompt:\n${prompt}\n\nLoop protocol:\n- Do one focused iteration only.\n- Use available execution skills/tools as needed.\n- You may run checks while working, but final completion is decided by the extension running the authoritative verifier after your report.\n- End by calling loop_report exactly once.\n- Set blocked=true only if progress requires human input, missing access, ambiguity, or an unsafe action.\n- If not blocked, include nextPrompt only when you have a useful hint for a possible next iteration.`;
+  const plan = formatPlan(run);
+  return `You are running Pi loop \"${run.spec.name}\".\n\nGoal:\n${run.spec.goal}\n\nCurrent step:\n${currentStepLabel(run)}\n\nDone when for current step:\n${step.doneWhen}\n\nAuthoritative verifier for current step:\n${step.verifyCommand}\n\nTotal iteration ${run.iteration} of ${run.spec.maxIterations}. Step iteration ${run.stepIteration} of ${run.spec.maxIterationsPerStep}.\n${plan}${tdd}\nPrevious loop history:\n${formatHistory(run)}\n\nThis iteration prompt:\n${prompt}\n\nLoop protocol:\n- Do one focused iteration only.\n- Use available execution skills/tools as needed.\n- You may run checks while working, but final step completion is decided by the extension running the authoritative verifier after your report.\n- End by calling loop_report exactly once.\n- Set blocked=true only if progress requires human input, missing access, ambiguity, or an unsafe action.\n- If not blocked, include nextPrompt only when you have a useful hint for a possible next iteration.\n- In test-plan mode, the extension advances to the next test step only after the current step verifier passes.`;
 }
 
 function statusText(run?: ActiveRun) {
   if (!run) return "loop: idle";
-  return `loop: ${run.spec.name} ${run.status} ${run.iteration}/${run.spec.maxIterations}`;
+  return `loop: ${run.spec.name} ${run.status} total ${run.iteration}/${run.spec.maxIterations}, step ${currentStepLabel(run)} ${run.stepIteration}/${run.spec.maxIterationsPerStep}`;
 }
 
 function updateUi(ctx: { ui?: { setStatus?: (key: string, value?: string) => void; setWidget?: (key: string, value?: string[] | undefined) => void } }, run?: ActiveRun) {
@@ -208,10 +286,11 @@ function updateUi(ctx: { ui?: { setStatus?: (key: string, value?: string) => voi
     ctx.ui?.setWidget?.("pi-loop", undefined);
     return;
   }
+  const step = currentStep(run);
   const last = run.history.at(-1);
   ctx.ui?.setWidget?.("pi-loop", [
-    `↻ Loop: ${run.spec.name} (${run.status}, iteration ${run.iteration}/${run.spec.maxIterations})`,
-    `Verifier: ${run.spec.verifyCommand}`,
+    `↻ Loop: ${run.spec.name} (${run.status}, ${currentStepLabel(run)})`,
+    `Verifier: ${step.verifyCommand}`,
     last ? `Last: ${last.status} — ${last.verification}` : "Last: not started",
   ]);
 }
@@ -230,15 +309,18 @@ function startRun(cwd: string, spec: LoopSpec, specPath: string): ActiveRun {
     logPath,
     spec,
     iteration: 1,
+    stepIteration: 1,
+    currentStepIndex: 0,
     status: "running",
     startedAt,
     updatedAt: startedAt,
     history: [],
   };
+  const step = currentStep(run);
   writeJson(runPath, run);
   appendFileSync(
     logPath,
-    `# Loop run: ${spec.name}\n\n- Run ID: ${runId}\n- Started: ${startedAt}\n- Goal: ${spec.goal}\n- Mode: ${spec.mode}\n- Done when: ${spec.doneWhen}\n- Verifier: ${spec.verifyCommand}\n- Spec: ${specPath}\n`,
+    `# Loop run: ${spec.name}\n\n- Run ID: ${runId}\n- Started: ${startedAt}\n- Goal: ${spec.goal}\n- Mode: ${spec.mode}\n- Current step: ${currentStepLabel(run)}\n- Done when: ${step.doneWhen}\n- Verifier: ${step.verifyCommand}\n- Final verifier: ${spec.finalVerifyCommand || "none"}\n- Spec: ${specPath}\n`,
     "utf8",
   );
   return run;
@@ -251,7 +333,7 @@ export default function piLoop(pi: ExtensionAPI) {
     skillPaths: [join(dirname(__filename), "skills")],
   }));
 
-  async function queueNext(run: ActiveRun, prompt: string) {
+  async function queueNext(run: ActiveRun, prompt?: string) {
     const message = buildIterationPrompt(run, prompt);
     if (pi.getSessionName?.() === undefined) pi.setSessionName?.(`Loop: ${run.spec.name}`);
     try {
@@ -261,14 +343,51 @@ export default function piLoop(pi: ExtensionAPI) {
     }
   }
 
-  async function runVerifier(run: ActiveRun, signal?: AbortSignal) {
-    const command = `cd ${shellQuote(run.cwd)} && ${run.spec.verifyCommand}`;
-    const result = await pi.exec("bash", ["-lc", command], { signal, timeout: run.spec.verifyTimeoutMs } as any) as any;
+  async function runVerifier(run: ActiveRun, signal: AbortSignal | undefined, command = currentStep(run).verifyCommand) {
+    const shellCommand = `cd ${shellQuote(run.cwd)} && ${command}`;
+    const result = await pi.exec("bash", ["-lc", shellCommand], { signal, timeout: run.spec.verifyTimeoutMs } as any) as any;
     const exitCode = typeof result.code === "number" ? result.code : null;
     const stdout = trunc(result.stdout);
     const stderr = trunc(result.stderr);
-    const verification = `\`${run.spec.verifyCommand}\` exited ${exitCode}${result.killed ? " (killed/timeout)" : ""}`;
-    return { exitCode, stdout, stderr, verification };
+    const verification = `\`${command}\` exited ${exitCode}${result.killed ? " (killed/timeout)" : ""}`;
+    return { command, exitCode, stdout, stderr, verification };
+  }
+
+  function makeEntry(run: ActiveRun, report: LoopReport, status: LoopStatus, verification: Awaited<ReturnType<typeof runVerifier>>, stepName = currentStep(run).name): HistoryEntry {
+    return {
+      ...report,
+      iteration: run.iteration,
+      stepIteration: run.stepIteration,
+      stepIndex: isTestPlan(run) ? run.currentStepIndex : undefined,
+      stepName,
+      timestamp: nowStamp(),
+      status,
+      verification: verification.verification,
+      verifyCommand: verification.command,
+      verifyExitCode: verification.exitCode,
+      verifyStdout: verification.stdout,
+      verifyStderr: verification.stderr,
+    };
+  }
+
+  function stopRun(ctx: any, status: RunStatus, message: string, details: Record<string, unknown>) {
+    if (!activeRun) return { content: [{ type: "text", text: message }], details, terminate: true };
+    activeRun.status = status;
+    persistRun(activeRun);
+    updateUi(ctx, activeRun);
+    const runPath = activeRun.runPath;
+    activeRun = undefined;
+    updateUi(ctx, undefined);
+    return {
+      content: [{ type: "text", text: `${message} Run saved to ${runPath}` }],
+      details: { ...details, runPath },
+      terminate: true,
+    };
+  }
+
+  async function maybeConfirmContinue(ctx: any, title: string, body: string) {
+    if (!activeRun?.spec.trainingMode || !ctx.hasUI) return true;
+    return await ctx.ui.confirm(title, body);
   }
 
   async function handleNew(args: string, ctx: any) {
@@ -314,14 +433,18 @@ export default function piLoop(pi: ExtensionAPI) {
       return;
     }
     const { spec, path } = loadSpec(ctx.cwd, specArg);
-    if (!spec.verifyCommand.trim()) {
+    if (spec.mode === "test-plan" && spec.plan.length === 0) {
+      ctx.ui.notify("test-plan specs need a non-empty plan array.", "warning");
+      return;
+    }
+    if (!spec.verifyCommand.trim() && spec.plan.length === 0) {
       ctx.ui.notify("Loop spec needs a non-empty verifyCommand.", "warning");
       return;
     }
     activeRun = startRun(ctx.cwd, spec, path);
     updateUi(ctx, activeRun);
     ctx.ui.notify(`Started loop ${spec.name} (${activeRun.runId})`, "info");
-    await queueNext(activeRun, spec.taskPrompt);
+    await queueNext(activeRun, currentStep(activeRun).taskPrompt);
   }
 
   async function handleStatus(_args: string, ctx: any) {
@@ -332,7 +455,7 @@ export default function piLoop(pi: ExtensionAPI) {
     updateUi(ctx, activeRun);
     const last = activeRun.history.at(-1);
     ctx.ui.notify(
-      `${statusText(activeRun)}\nRun file: ${activeRun.runPath}\nVerifier: ${activeRun.spec.verifyCommand}\n${last ? `Last report: ${last.status} — ${last.verification}` : "No reports yet."}`,
+      `${statusText(activeRun)}\nRun file: ${activeRun.runPath}\nVerifier: ${currentStep(activeRun).verifyCommand}\n${last ? `Last report: ${last.status} — ${last.verification}` : "No reports yet."}`,
       "info",
     );
   }
@@ -388,11 +511,11 @@ export default function piLoop(pi: ExtensionAPI) {
   pi.registerTool({
     name: "loop_report",
     label: "Loop Report",
-    description: "Report one loop iteration to the Pi loop orchestrator. The extension then runs verifyCommand and decides done/not_done deterministically.",
-    promptSnippet: "Report loop iteration progress; pi-loop runs verifyCommand to decide completion",
+    description: "Report one loop iteration to the Pi loop orchestrator. The extension then runs the current step verifier and decides progress deterministically.",
+    promptSnippet: "Report loop iteration progress; pi-loop runs the current verifier to decide completion",
     promptGuidelines: [
       "Use loop_report exactly once at the end of a Pi loop iteration when a /loop:run prompt asks for it.",
-      "Do not claim loop completion in loop_report; pi-loop decides completion by running verifyCommand.",
+      "Do not claim loop completion in loop_report; pi-loop decides completion by running the current verifyCommand.",
       "Set loop_report blocked=true only when progress requires human input, missing access, ambiguity, or an unsafe action.",
     ],
     parameters: LoopReportSchema,
@@ -410,98 +533,103 @@ export default function piLoop(pi: ExtensionAPI) {
         const entry: HistoryEntry = {
           ...report,
           iteration: activeRun.iteration,
+          stepIteration: activeRun.stepIteration,
+          stepIndex: isTestPlan(activeRun) ? activeRun.currentStepIndex : undefined,
+          stepName: currentStep(activeRun).name,
           timestamp: nowStamp(),
           status: "blocked",
           verification: "Agent reported blocked before verifier could decide completion.",
         };
         activeRun.history.push(entry);
         appendRunLog(activeRun, entry);
-        activeRun.status = "blocked";
-        persistRun(activeRun);
-        updateUi(ctx, activeRun);
-        const runPath = activeRun.runPath;
-        activeRun = undefined;
-        updateUi(ctx, undefined);
-        return {
-          content: [{ type: "text", text: `Loop blocked. Run saved to ${runPath}` }],
-          details: { accepted: true, finalStatus: "blocked", runPath },
-          terminate: true,
-        };
+        return stopRun(ctx, "blocked", "Loop blocked.", { accepted: true, finalStatus: "blocked" });
       }
 
+      const step = currentStep(activeRun);
       const verification = await runVerifier(activeRun, signal);
       const status: LoopStatus = verification.exitCode === 0 ? "done" : "not_done";
-      const entry: HistoryEntry = {
-        ...report,
-        iteration: activeRun.iteration,
-        timestamp: nowStamp(),
-        status,
-        verification: verification.verification,
-        verifyCommand: activeRun.spec.verifyCommand,
-        verifyExitCode: verification.exitCode,
-        verifyStdout: verification.stdout,
-        verifyStderr: verification.stderr,
-      };
+      const entry = makeEntry(activeRun, report, status, verification, step.name);
       activeRun.history.push(entry);
       appendRunLog(activeRun, entry);
 
+      if (status === "done" && isTestPlan(activeRun) && activeRun.currentStepIndex < activeRun.spec.plan.length - 1) {
+        const completedStep = currentStepLabel(activeRun);
+        activeRun.currentStepIndex += 1;
+        activeRun.iteration += 1;
+        activeRun.stepIteration = 1;
+        persistRun(activeRun);
+        updateUi(ctx, activeRun);
+        const nextStep = currentStep(activeRun);
+        const ok = await maybeConfirmContinue(
+          ctx,
+          `Continue loop ${activeRun.spec.name}?`,
+          `Completed ${completedStep}.\n\nNext step: ${currentStepLabel(activeRun)}\nVerifier: ${nextStep.verifyCommand}`,
+        );
+        if (!ok) return stopRun(ctx, "stopped", "Loop paused by user.", { accepted: true, finalStatus: "stopped", verification });
+        await queueNext(activeRun, nextStep.taskPrompt);
+        return {
+          content: [{ type: "text", text: `Step verifier passed; queued next test step ${currentStepLabel(activeRun)}.` }],
+          details: { accepted: true, finalStatus: "running", runPath: activeRun.runPath, nextIteration: activeRun.iteration, verification },
+          terminate: true,
+        };
+      }
+
+      if (status === "done" && activeRun.spec.finalVerifyCommand) {
+        const finalVerification = await runVerifier(activeRun, signal, activeRun.spec.finalVerifyCommand);
+        const finalStatus: LoopStatus = finalVerification.exitCode === 0 ? "done" : "not_done";
+        const finalEntry = makeEntry(activeRun, { ...report, summary: `Final verifier after: ${report.summary}` }, finalStatus, finalVerification, "final-verifier");
+        activeRun.history.push(finalEntry);
+        appendRunLog(activeRun, finalEntry);
+        if (finalStatus === "done") {
+          return stopRun(ctx, "done", "Loop complete: final verifier passed.", { accepted: true, finalStatus: "done", verification: finalVerification });
+        }
+        if (activeRun.iteration >= activeRun.spec.maxIterations || activeRun.stepIteration >= activeRun.spec.maxIterationsPerStep) {
+          return stopRun(ctx, "max_iterations", "Loop stopped at maxIterations: final verifier still fails.", { accepted: true, finalStatus: "max_iterations", verification: finalVerification });
+        }
+        activeRun.iteration += 1;
+        activeRun.stepIteration += 1;
+        persistRun(activeRun);
+        updateUi(ctx, activeRun);
+        const finalPrompt = report.nextPrompt?.trim() || `All planned step tests passed, but the final verifier failed: ${activeRun.spec.finalVerifyCommand}. Fix integration/regression failures while preserving the passing step tests, then call loop_report.`;
+        const ok = await maybeConfirmContinue(
+          ctx,
+          `Continue loop ${activeRun.spec.name}?`,
+          `Final verifier failed: ${finalVerification.verification}\n\nNext iteration: ${activeRun.iteration}/${activeRun.spec.maxIterations}`,
+        );
+        if (!ok) return stopRun(ctx, "stopped", "Loop paused by user.", { accepted: true, finalStatus: "stopped", verification: finalVerification });
+        await queueNext(activeRun, finalPrompt);
+        return {
+          content: [{ type: "text", text: `Final verifier failed; queued loop iteration ${activeRun.iteration}/${activeRun.spec.maxIterations}.` }],
+          details: { accepted: true, finalStatus: "running", runPath: activeRun.runPath, nextIteration: activeRun.iteration, verification: finalVerification },
+          terminate: true,
+        };
+      }
+
       if (status === "done") {
-        activeRun.status = "done";
-        persistRun(activeRun);
-        updateUi(ctx, activeRun);
-        const runPath = activeRun.runPath;
-        activeRun = undefined;
-        updateUi(ctx, undefined);
-        return {
-          content: [{ type: "text", text: `Loop complete: verifier passed. Run saved to ${runPath}` }],
-          details: { accepted: true, finalStatus: "done", runPath, verification },
-          terminate: true,
-        };
+        return stopRun(ctx, "done", "Loop complete: verifier passed.", { accepted: true, finalStatus: "done", verification });
       }
 
-      if (activeRun.iteration >= activeRun.spec.maxIterations) {
-        activeRun.status = "max_iterations";
-        persistRun(activeRun);
-        updateUi(ctx, activeRun);
-        const runPath = activeRun.runPath;
-        activeRun = undefined;
-        updateUi(ctx, undefined);
-        return {
-          content: [{ type: "text", text: `Loop stopped at maxIterations: verifier still fails. Run saved to ${runPath}` }],
-          details: { accepted: true, finalStatus: "max_iterations", runPath, verification },
-          terminate: true,
-        };
+      if (activeRun.iteration >= activeRun.spec.maxIterations || activeRun.stepIteration >= activeRun.spec.maxIterationsPerStep) {
+        return stopRun(ctx, "max_iterations", "Loop stopped at maxIterations: verifier still fails.", { accepted: true, finalStatus: "max_iterations", verification });
       }
 
-      const nextPrompt = report.nextPrompt?.trim() || activeRun.spec.taskPrompt;
+      const nextPrompt = report.nextPrompt?.trim() || step.taskPrompt;
       activeRun.iteration += 1;
+      activeRun.stepIteration += 1;
       persistRun(activeRun);
       updateUi(ctx, activeRun);
 
-      if (activeRun.spec.trainingMode && ctx.hasUI) {
-        const shouldContinue = await ctx.ui.confirm(
-          `Continue loop ${activeRun.spec.name}?`,
-          `Next iteration: ${activeRun.iteration}/${activeRun.spec.maxIterations}\n\nVerifier failed: ${verification.verification}\n\nLast summary: ${report.summary}`,
-        );
-        if (!shouldContinue) {
-          activeRun.status = "stopped";
-          persistRun(activeRun);
-          const runPath = activeRun.runPath;
-          activeRun = undefined;
-          updateUi(ctx, undefined);
-          return {
-            content: [{ type: "text", text: `Loop paused by user. Run saved to ${runPath}` }],
-            details: { accepted: true, finalStatus: "stopped", runPath, verification },
-            terminate: true,
-          };
-        }
-      }
+      const ok = await maybeConfirmContinue(
+        ctx,
+        `Continue loop ${activeRun.spec.name}?`,
+        `Next iteration: ${activeRun.iteration}/${activeRun.spec.maxIterations}\nStep iteration: ${activeRun.stepIteration}/${activeRun.spec.maxIterationsPerStep}\n\nVerifier failed: ${verification.verification}\n\nLast summary: ${report.summary}`,
+      );
+      if (!ok) return stopRun(ctx, "stopped", "Loop paused by user.", { accepted: true, finalStatus: "stopped", verification });
 
-      const run = activeRun;
-      await queueNext(run, nextPrompt);
+      await queueNext(activeRun, nextPrompt);
       return {
-        content: [{ type: "text", text: `Verifier failed; queued loop iteration ${run.iteration}/${run.spec.maxIterations}.` }],
-        details: { accepted: true, finalStatus: "running", runPath: run.runPath, nextIteration: run.iteration, verification },
+        content: [{ type: "text", text: `Verifier failed; queued loop iteration ${activeRun.iteration}/${activeRun.spec.maxIterations}.` }],
+        details: { accepted: true, finalStatus: "running", runPath: activeRun.runPath, nextIteration: activeRun.iteration, verification },
         terminate: true,
       };
     },
