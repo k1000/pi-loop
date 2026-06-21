@@ -12,13 +12,15 @@ const DEFAULT_ITERATIONS_PER_STEP = 3;
 
 type LoopStatus = "done" | "not_done" | "blocked";
 type RunStatus = "running" | "done" | "blocked" | "stopped" | "max_iterations";
-type LoopMode = "tdd" | "standard" | "test-plan";
+type LoopMode = "tdd" | "standard" | "test-plan" | "dag-plan";
 
 type LoopStep = {
+  id: string;
   name: string;
   taskPrompt: string;
   verifyCommand: string;
   doneWhen: string;
+  dependsOn: string[];
 };
 
 type LoopSpec = {
@@ -35,9 +37,11 @@ type LoopSpec = {
   verifyTimeoutMs: number;
   plan: LoopStep[];
   finalVerifyCommand?: string;
+  parallelism: number;
 };
 
 const LoopReportSchema = Type.Object({
+  taskId: Type.Optional(Type.String({ description: "For dag-plan loops, the ready task id completed or attempted in this iteration. Omit to use the current suggested task." })),
   summary: Type.String({ description: "Concise summary of what happened in this iteration." }),
   blocked: Type.Optional(Type.Boolean({ description: "Set true only when human input, missing access, ambiguity, or an unsafe next step blocks progress." })),
   nextPrompt: Type.Optional(Type.String({ description: "Specific prompt for the next iteration if the verifier still fails." })),
@@ -51,6 +55,7 @@ type HistoryEntry = LoopReport & {
   iteration: number;
   stepIteration: number;
   stepIndex?: number;
+  stepId?: string;
   stepName?: string;
   timestamp: string;
   status: LoopStatus;
@@ -71,6 +76,8 @@ type ActiveRun = {
   iteration: number;
   stepIteration: number;
   currentStepIndex: number;
+  currentTaskId?: string;
+  completedTaskIds: string[];
   status: RunStatus;
   startedAt: string;
   updatedAt: string;
@@ -116,11 +123,15 @@ function shellQuote(value: string) {
 function normalizeStep(raw: unknown, index: number, fallback: Pick<LoopStep, "taskPrompt" | "verifyCommand" | "doneWhen">): LoopStep {
   const input = (raw && typeof raw === "object" ? raw : {}) as Partial<LoopStep>;
   const name = String(input.name || `step-${index + 1}`);
+  const id = sanitizeName(String(input.id || name || `step-${index + 1}`));
+  const dependsOn = Array.isArray(input.dependsOn) ? input.dependsOn.map((dep) => sanitizeName(String(dep))).filter(Boolean) : [];
   return {
+    id,
     name,
     taskPrompt: String(input.taskPrompt || fallback.taskPrompt),
     verifyCommand: String(input.verifyCommand || fallback.verifyCommand),
     doneWhen: String(input.doneWhen || fallback.doneWhen),
+    dependsOn,
   };
 }
 
@@ -152,17 +163,18 @@ function normalizeSpec(raw: unknown, fallbackName: string): LoopSpec {
     doneWhen: String(input.doneWhen || input.doneRule || "verifyCommand exits 0"),
   };
   const plan = Array.isArray(input.plan) ? input.plan.map((step, index) => normalizeStep(step, index, fallback)) : [];
-  const mode: LoopMode = input.mode === "test-plan" || plan.length > 0 ? "test-plan" : input.mode === "standard" ? "standard" : "tdd";
+  const mode: LoopMode = input.mode === "dag-plan" ? "dag-plan" : input.mode === "test-plan" || plan.length > 0 ? "test-plan" : input.mode === "standard" ? "standard" : "tdd";
   const maxIterationsPerStep = Math.max(
     1,
     Math.min(MAX_SAFE_ITERATIONS, Number.isFinite(input.maxIterationsPerStep) ? Math.floor(Number(input.maxIterationsPerStep)) : DEFAULT_ITERATIONS_PER_STEP),
   );
-  const defaultMaxIterations = mode === "test-plan" ? Math.min(MAX_SAFE_ITERATIONS, Math.max(1, plan.length || 1) * maxIterationsPerStep + (input.finalVerifyCommand ? maxIterationsPerStep : 0)) : 5;
+  const defaultMaxIterations = mode === "test-plan" || mode === "dag-plan" ? Math.min(MAX_SAFE_ITERATIONS, Math.max(1, plan.length || 1) * maxIterationsPerStep + (input.finalVerifyCommand ? maxIterationsPerStep : 0)) : 5;
   const maxIterations = Math.max(
     1,
     Math.min(MAX_SAFE_ITERATIONS, Number.isFinite(input.maxIterations) ? Math.floor(Number(input.maxIterations)) : defaultMaxIterations),
   );
   const verifyTimeoutMs = Math.max(1_000, Number.isFinite(input.verifyTimeoutMs) ? Math.floor(Number(input.verifyTimeoutMs)) : DEFAULT_VERIFY_TIMEOUT_MS);
+  const parallelism = Math.max(1, Math.min(MAX_SAFE_ITERATIONS, Number.isFinite(input.parallelism) ? Math.floor(Number(input.parallelism)) : 1));
   return {
     name,
     goal: String(input.goal || "Complete the requested task."),
@@ -175,6 +187,7 @@ function normalizeSpec(raw: unknown, fallbackName: string): LoopSpec {
     trainingMode: input.trainingMode !== false,
     verifyTimeoutMs,
     plan,
+    parallelism,
     ...(input.finalVerifyCommand ? { finalVerifyCommand: String(input.finalVerifyCommand) } : {}),
     ...(input.memoryPath ? { memoryPath: String(input.memoryPath) } : {}),
   };
@@ -194,6 +207,7 @@ function defaultSpec(name: string): LoopSpec {
     trainingMode: true,
     verifyTimeoutMs: DEFAULT_VERIFY_TIMEOUT_MS,
     plan: [],
+    parallelism: 1,
   };
 }
 
@@ -225,23 +239,62 @@ function persistRun(run: ActiveRun) {
   writeJson(run.runPath, run);
 }
 
-function isTestPlan(run: ActiveRun) {
+function isLinearPlan(run: ActiveRun) {
   return run.spec.mode === "test-plan" && run.spec.plan.length > 0;
 }
 
+function isDagPlan(run: ActiveRun) {
+  return run.spec.mode === "dag-plan" && run.spec.plan.length > 0;
+}
+
+function completedTaskSet(run: ActiveRun) {
+  return new Set(run.completedTaskIds);
+}
+
+function readyDagSteps(run: ActiveRun) {
+  if (!isDagPlan(run)) return [];
+  const done = completedTaskSet(run);
+  return run.spec.plan.filter((step) => !done.has(step.id) && step.dependsOn.every((dep) => done.has(dep))).slice(0, run.spec.parallelism);
+}
+
+function findStep(run: ActiveRun, id: string) {
+  return run.spec.plan.find((step) => step.id === id);
+}
+
+function selectDagStep(run: ActiveRun, requestedTaskId?: string) {
+  const ready = readyDagSteps(run);
+  if (requestedTaskId) {
+    const requested = ready.find((step) => step.id === sanitizeName(requestedTaskId));
+    if (requested) return requested;
+  }
+  if (run.currentTaskId) {
+    const current = ready.find((step) => step.id === run.currentTaskId);
+    if (current) return current;
+  }
+  return ready[0];
+}
+
 function currentStep(run: ActiveRun): LoopStep {
-  if (isTestPlan(run)) return run.spec.plan[Math.min(run.currentStepIndex, run.spec.plan.length - 1)];
+  if (isLinearPlan(run)) return run.spec.plan[Math.min(run.currentStepIndex, run.spec.plan.length - 1)];
+  if (isDagPlan(run)) {
+    const selected = selectDagStep(run);
+    if (selected) return selected;
+    return run.spec.plan.find((step) => !completedTaskSet(run).has(step.id)) ?? run.spec.plan[run.spec.plan.length - 1];
+  }
   return {
+    id: "single-step",
     name: "single-step",
     taskPrompt: run.spec.taskPrompt,
     verifyCommand: run.spec.verifyCommand,
     doneWhen: run.spec.doneWhen,
+    dependsOn: [],
   };
 }
 
 function currentStepLabel(run: ActiveRun) {
-  if (!isTestPlan(run)) return "single-step";
-  return `${run.currentStepIndex + 1}/${run.spec.plan.length}: ${currentStep(run).name}`;
+  if (isLinearPlan(run)) return `${run.currentStepIndex + 1}/${run.spec.plan.length}: ${currentStep(run).name}`;
+  if (isDagPlan(run)) return `ready: ${currentStep(run).id} (${currentStep(run).name})`;
+  return "single-step";
 }
 
 function formatHistory(run: ActiveRun) {
@@ -256,23 +309,40 @@ function formatHistory(run: ActiveRun) {
 }
 
 function formatPlan(run: ActiveRun) {
-  if (!isTestPlan(run)) return "";
-  const lines = run.spec.plan.map((step, index) => {
-    const marker = index < run.currentStepIndex ? "✓" : index === run.currentStepIndex ? "→" : "•";
-    return `${marker} ${index + 1}. ${step.name} — ${step.verifyCommand}`;
-  });
-  const final = run.spec.finalVerifyCommand ? [`Final verifier: ${run.spec.finalVerifyCommand}`] : [];
-  return `\nTest plan:\n${[...lines, ...final].join("\n")}\n`;
+  if (isLinearPlan(run)) {
+    const lines = run.spec.plan.map((step, index) => {
+      const marker = index < run.currentStepIndex ? "✓" : index === run.currentStepIndex ? "→" : "•";
+      return `${marker} ${index + 1}. ${step.name} [${step.id}] — ${step.verifyCommand}`;
+    });
+    const final = run.spec.finalVerifyCommand ? [`Final verifier: ${run.spec.finalVerifyCommand}`] : [];
+    return `\nTest plan:\n${[...lines, ...final].join("\n")}\n`;
+  }
+  if (isDagPlan(run)) {
+    const done = completedTaskSet(run);
+    const ready = new Set(readyDagSteps(run).map((step) => step.id));
+    const lines = run.spec.plan.map((step) => {
+      const marker = done.has(step.id) ? "✓" : ready.has(step.id) ? "→" : "•";
+      const deps = step.dependsOn.length ? ` deps: ${step.dependsOn.join(",")}` : "";
+      return `${marker} ${step.id}: ${step.name}${deps} — ${step.verifyCommand}`;
+    });
+    const final = run.spec.finalVerifyCommand ? [`Final verifier: ${run.spec.finalVerifyCommand}`] : [];
+    return `\nDAG test plan (→ ready, ✓ done):\n${[...lines, ...final].join("\n")}\n`;
+  }
+  return "";
 }
 
 function buildIterationPrompt(run: ActiveRun, promptOverride?: string) {
   const step = currentStep(run);
   const prompt = promptOverride?.trim() || step.taskPrompt;
-  const tdd = run.spec.mode === "tdd" || run.spec.mode === "test-plan"
-    ? "\nTDD mode:\n- Codify the expected functionality into tests.\n- For this iteration, satisfy the current test step only.\n- Completion verification is the authoritative test command passing.\n"
+  const ready = isDagPlan(run) ? readyDagSteps(run) : [];
+  const dagInstructions = isDagPlan(run)
+    ? `\nDAG mode:\n- Independent ready tasks may be implemented in any safe order.\n- Work on exactly one ready task in this iteration. Suggested task: ${step.id}.\n- If you choose a different ready task, set loop_report.taskId to that task id.\n- Ready task ids: ${ready.map((s) => s.id).join(", ") || "none"}.\n`
+    : "";
+  const tdd = run.spec.mode === "tdd" || run.spec.mode === "test-plan" || run.spec.mode === "dag-plan"
+    ? "\nTDD mode:\n- Codify the expected functionality into tests.\n- For this iteration, satisfy the current test-backed step only.\n- Completion verification is the authoritative test command passing.\n"
     : "";
   const plan = formatPlan(run);
-  return `You are running Pi loop \"${run.spec.name}\".\n\nGoal:\n${run.spec.goal}\n\nCurrent step:\n${currentStepLabel(run)}\n\nDone when for current step:\n${step.doneWhen}\n\nAuthoritative verifier for current step:\n${step.verifyCommand}\n\nTotal iteration ${run.iteration} of ${run.spec.maxIterations}. Step iteration ${run.stepIteration} of ${run.spec.maxIterationsPerStep}.\n${plan}${tdd}\nPrevious loop history:\n${formatHistory(run)}\n\nThis iteration prompt:\n${prompt}\n\nLoop protocol:\n- Do one focused iteration only.\n- Use available execution skills/tools as needed.\n- You may run checks while working, but final step completion is decided by the extension running the authoritative verifier after your report.\n- End by calling loop_report exactly once.\n- Set blocked=true only if progress requires human input, missing access, ambiguity, or an unsafe action.\n- If not blocked, include nextPrompt only when you have a useful hint for a possible next iteration.\n- In test-plan mode, the extension advances to the next test step only after the current step verifier passes.`;
+  return `You are running Pi loop \"${run.spec.name}\".\n\nGoal:\n${run.spec.goal}\n\nCurrent step:\n${currentStepLabel(run)}\n\nDone when for current step:\n${step.doneWhen}\n\nAuthoritative verifier for current step:\n${step.verifyCommand}\n\nTotal iteration ${run.iteration} of ${run.spec.maxIterations}. Step iteration ${run.stepIteration} of ${run.spec.maxIterationsPerStep}.\n${plan}${dagInstructions}${tdd}\nPrevious loop history:\n${formatHistory(run)}\n\nThis iteration prompt:\n${prompt}\n\nLoop protocol:\n- Do one focused iteration only.\n- Use available execution skills/tools as needed.\n- You may run checks while working, but final step completion is decided by the extension running the authoritative verifier after your report.\n- End by calling loop_report exactly once.\n- Set blocked=true only if progress requires human input, missing access, ambiguity, or an unsafe action.\n- If not blocked, include nextPrompt only when you have a useful hint for a possible next iteration.\n- In test-plan mode, the extension advances to the next test step only after the current step verifier passes.\n- In dag-plan mode, the extension marks the reported ready task done after its verifier passes and unlocks dependent tasks.`;
 }
 
 function statusText(run?: ActiveRun) {
@@ -301,6 +371,7 @@ function startRun(cwd: string, spec: LoopSpec, specPath: string): ActiveRun {
   const baseRunDir = spec.memoryPath ? resolve(cwd, spec.memoryPath) : join(projectLoopDir(cwd), "runs", sanitizeName(spec.name));
   const runPath = join(baseRunDir, `${runId}.json`);
   const logPath = join(baseRunDir, `${runId}.md`);
+  const firstTaskId = spec.mode === "dag-plan" ? spec.plan.find((step) => step.dependsOn.length === 0)?.id : undefined;
   const run: ActiveRun = {
     runId,
     cwd,
@@ -311,6 +382,8 @@ function startRun(cwd: string, spec: LoopSpec, specPath: string): ActiveRun {
     iteration: 1,
     stepIteration: 1,
     currentStepIndex: 0,
+    currentTaskId: firstTaskId,
+    completedTaskIds: [],
     status: "running",
     startedAt,
     updatedAt: startedAt,
@@ -320,7 +393,7 @@ function startRun(cwd: string, spec: LoopSpec, specPath: string): ActiveRun {
   writeJson(runPath, run);
   appendFileSync(
     logPath,
-    `# Loop run: ${spec.name}\n\n- Run ID: ${runId}\n- Started: ${startedAt}\n- Goal: ${spec.goal}\n- Mode: ${spec.mode}\n- Current step: ${currentStepLabel(run)}\n- Done when: ${step.doneWhen}\n- Verifier: ${step.verifyCommand}\n- Final verifier: ${spec.finalVerifyCommand || "none"}\n- Spec: ${specPath}\n`,
+    `# Loop run: ${spec.name}\n\n- Run ID: ${runId}\n- Started: ${startedAt}\n- Goal: ${spec.goal}\n- Mode: ${spec.mode}\n- Current step: ${currentStepLabel(run)}\n- Done when: ${step.doneWhen}\n- Verifier: ${step.verifyCommand}\n- Parallelism: ${spec.parallelism}\n- Final verifier: ${spec.finalVerifyCommand || "none"}\n- Spec: ${specPath}\n`,
     "utf8",
   );
   return run;
@@ -353,13 +426,14 @@ export default function piLoop(pi: ExtensionAPI) {
     return { command, exitCode, stdout, stderr, verification };
   }
 
-  function makeEntry(run: ActiveRun, report: LoopReport, status: LoopStatus, verification: Awaited<ReturnType<typeof runVerifier>>, stepName = currentStep(run).name): HistoryEntry {
+  function makeEntry(run: ActiveRun, report: LoopReport, status: LoopStatus, verification: Awaited<ReturnType<typeof runVerifier>>, step = currentStep(run)): HistoryEntry {
     return {
       ...report,
       iteration: run.iteration,
       stepIteration: run.stepIteration,
-      stepIndex: isTestPlan(run) ? run.currentStepIndex : undefined,
-      stepName,
+      stepIndex: isLinearPlan(run) ? run.currentStepIndex : undefined,
+      stepId: step.id,
+      stepName: step.name,
       timestamp: nowStamp(),
       status,
       verification: verification.verification,
@@ -433,8 +507,12 @@ export default function piLoop(pi: ExtensionAPI) {
       return;
     }
     const { spec, path } = loadSpec(ctx.cwd, specArg);
-    if (spec.mode === "test-plan" && spec.plan.length === 0) {
-      ctx.ui.notify("test-plan specs need a non-empty plan array.", "warning");
+    if ((spec.mode === "test-plan" || spec.mode === "dag-plan") && spec.plan.length === 0) {
+      ctx.ui.notify(`${spec.mode} specs need a non-empty plan array.`, "warning");
+      return;
+    }
+    if (spec.mode === "dag-plan" && spec.plan.length > 0 && !spec.plan.some((step) => step.dependsOn.length === 0)) {
+      ctx.ui.notify("dag-plan specs need at least one task with no dependsOn.", "warning");
       return;
     }
     if (!spec.verifyCommand.trim() && spec.plan.length === 0) {
@@ -529,13 +607,21 @@ export default function piLoop(pi: ExtensionAPI) {
       }
 
       const report = params as LoopReport;
+      const requestedTaskId = report.taskId ? sanitizeName(report.taskId) : undefined;
+      const step = isDagPlan(activeRun) ? selectDagStep(activeRun, requestedTaskId) : currentStep(activeRun);
+      if (!step) {
+        return stopRun(ctx, "blocked", "Loop blocked: no ready DAG task is available.", { accepted: true, finalStatus: "blocked" });
+      }
+      if (isDagPlan(activeRun)) activeRun.currentTaskId = step.id;
+
       if (report.blocked) {
         const entry: HistoryEntry = {
           ...report,
           iteration: activeRun.iteration,
           stepIteration: activeRun.stepIteration,
-          stepIndex: isTestPlan(activeRun) ? activeRun.currentStepIndex : undefined,
-          stepName: currentStep(activeRun).name,
+          stepIndex: isLinearPlan(activeRun) ? activeRun.currentStepIndex : undefined,
+          stepId: step.id,
+          stepName: step.name,
           timestamp: nowStamp(),
           status: "blocked",
           verification: "Agent reported blocked before verifier could decide completion.",
@@ -545,14 +631,37 @@ export default function piLoop(pi: ExtensionAPI) {
         return stopRun(ctx, "blocked", "Loop blocked.", { accepted: true, finalStatus: "blocked" });
       }
 
-      const step = currentStep(activeRun);
-      const verification = await runVerifier(activeRun, signal);
+      const verification = await runVerifier(activeRun, signal, step.verifyCommand);
       const status: LoopStatus = verification.exitCode === 0 ? "done" : "not_done";
-      const entry = makeEntry(activeRun, report, status, verification, step.name);
+      const entry = makeEntry(activeRun, report, status, verification, step);
       activeRun.history.push(entry);
       appendRunLog(activeRun, entry);
 
-      if (status === "done" && isTestPlan(activeRun) && activeRun.currentStepIndex < activeRun.spec.plan.length - 1) {
+      if (status === "done" && isDagPlan(activeRun)) {
+        if (!activeRun.completedTaskIds.includes(step.id)) activeRun.completedTaskIds.push(step.id);
+        activeRun.currentTaskId = selectDagStep(activeRun)?.id;
+        if (activeRun.completedTaskIds.length < activeRun.spec.plan.length) {
+          activeRun.iteration += 1;
+          activeRun.stepIteration = 1;
+          persistRun(activeRun);
+          updateUi(ctx, activeRun);
+          const nextStep = currentStep(activeRun);
+          const ok = await maybeConfirmContinue(
+            ctx,
+            `Continue loop ${activeRun.spec.name}?`,
+            `Completed DAG task ${step.id}.\n\nNext ready task: ${currentStepLabel(activeRun)}\nVerifier: ${nextStep.verifyCommand}`,
+          );
+          if (!ok) return stopRun(ctx, "stopped", "Loop paused by user.", { accepted: true, finalStatus: "stopped", verification });
+          await queueNext(activeRun, nextStep.taskPrompt);
+          return {
+            content: [{ type: "text", text: `DAG task verifier passed; queued ready task ${currentStepLabel(activeRun)}.` }],
+            details: { accepted: true, finalStatus: "running", runPath: activeRun.runPath, nextIteration: activeRun.iteration, completedTaskIds: activeRun.completedTaskIds, verification },
+            terminate: true,
+          };
+        }
+      }
+
+      if (status === "done" && isLinearPlan(activeRun) && activeRun.currentStepIndex < activeRun.spec.plan.length - 1) {
         const completedStep = currentStepLabel(activeRun);
         activeRun.currentStepIndex += 1;
         activeRun.iteration += 1;
@@ -577,7 +686,14 @@ export default function piLoop(pi: ExtensionAPI) {
       if (status === "done" && activeRun.spec.finalVerifyCommand) {
         const finalVerification = await runVerifier(activeRun, signal, activeRun.spec.finalVerifyCommand);
         const finalStatus: LoopStatus = finalVerification.exitCode === 0 ? "done" : "not_done";
-        const finalEntry = makeEntry(activeRun, { ...report, summary: `Final verifier after: ${report.summary}` }, finalStatus, finalVerification, "final-verifier");
+        const finalEntry = makeEntry(activeRun, { ...report, summary: `Final verifier after: ${report.summary}` }, finalStatus, finalVerification, {
+          id: "final-verifier",
+          name: "final-verifier",
+          taskPrompt: "Final verification",
+          verifyCommand: activeRun.spec.finalVerifyCommand,
+          doneWhen: "finalVerifyCommand exits 0",
+          dependsOn: [],
+        });
         activeRun.history.push(finalEntry);
         appendRunLog(activeRun, finalEntry);
         if (finalStatus === "done") {

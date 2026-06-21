@@ -8,6 +8,8 @@ For coding tasks, the loop's job is simple:
 
 For larger features, use a **test plan**: an ordered list of test-backed steps. Pi-loop satisfies one step verifier at a time, advances only when that verifier passes, then optionally runs a final full-suite verifier.
 
+For features with independent parts, use a **DAG plan**: declare dependencies with `dependsOn`. Pi-loop exposes ready tasks whose dependencies have passed, lets the agent work on one ready task per iteration, and unlocks dependent tasks deterministically.
+
 ## Install
 
 Clone into Pi's global extension directory:
@@ -115,6 +117,47 @@ then, if configured:
   nonzero => queue integration/regression fix iteration
 ```
 
+## DAG-plan spec
+
+Use this when feature tasks do not all depend on each other:
+
+```json
+{
+  "name": "onboarding-parallel",
+  "goal": "Implement independent onboarding pieces",
+  "mode": "dag-plan",
+  "parallelism": 2,
+  "maxIterationsPerStep": 3,
+  "trainingMode": true,
+  "plan": [
+    {
+      "id": "draft-applicant",
+      "name": "Creates draft applicant",
+      "dependsOn": [],
+      "taskPrompt": "Write/update the draft applicant test, then implement the smallest behavior needed for it.",
+      "verifyCommand": "npm test -- onboarding.create-draft.test.ts"
+    },
+    {
+      "id": "field-validation",
+      "name": "Validates required fields",
+      "dependsOn": [],
+      "taskPrompt": "Write/update validation tests, then implement the smallest behavior needed for them.",
+      "verifyCommand": "npm test -- onboarding.validation.test.ts"
+    },
+    {
+      "id": "submit-kyc",
+      "name": "Submits to KYC",
+      "dependsOn": ["draft-applicant"],
+      "taskPrompt": "Write/update KYC submit tests, then implement the smallest behavior needed for them.",
+      "verifyCommand": "npm test -- onboarding.kyc-submit.test.ts"
+    }
+  ],
+  "finalVerifyCommand": "npm test -- onboarding"
+}
+```
+
+This is safe pseudo-parallelism in one Pi session: the prompt lists ready independent task ids. The agent works on one ready task and can set `loop_report.taskId`. True parallel worktrees can be added later, but this mode keeps one checkout deterministic.
+
 ## Deterministic runtime protocol
 
 `/loop:run` sends an iteration prompt to the agent. The agent must finish each iteration by calling `loop_report` with progress only:
@@ -131,12 +174,12 @@ then, if configured:
 Then the extension runs the current verifier and decides:
 
 ```txt
-exit 0       => step done / loop done
-exit nonzero => continue, or stop at maxIterations
+exit 0       => step/task done, unlock next eligible work, or finish loop
+exit nonzero => continue same step/task, or stop at maxIterations
 blocked true => blocked
 ```
 
-The agent does not decide `done`; passing the current verifier is the completion proof.
+In `dag-plan` mode, the agent may include `taskId` in `loop_report` to choose among currently-ready independent tasks. The agent does not decide `done`; passing the current verifier is the completion proof.
 
 Run memory is written by default to:
 
@@ -149,8 +192,9 @@ Run memory is written by default to:
 Every loop spec has:
 
 - `verifyCommand` or a test-backed `plan`.
+- `dependsOn` for DAG tasks that must wait for other tests to pass.
 - `maxIterations`, capped internally at 50.
-- `maxIterationsPerStep` for test plans.
+- `maxIterationsPerStep` for test/DAG plans.
 - `trainingMode`; keep this `true` until the loop is trusted.
 
 For fuzzy goals, first create a test plan or add a checker/approval gate, for example `review score >= 8/10` or `human approved`.

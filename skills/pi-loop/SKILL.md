@@ -15,7 +15,8 @@ For coding tasks, the core skill is:
 
 - Small task: one loop with one `verifyCommand`.
 - Medium task: one test file/suite, loop until that suite passes.
-- Large feature: `test-plan` mode — ordered test-backed steps, one verifier per step, optional final verifier.
+- Large sequential feature: `test-plan` mode — ordered test-backed steps, one verifier per step, optional final verifier.
+- Large feature with independent parts: `dag-plan` mode — test-backed tasks with `dependsOn`, ready tasks unlocked by passing verifiers.
 - Fuzzy feature: first loop writes the test plan/checker, then stop for human approval.
 
 ## Loopability check
@@ -80,6 +81,49 @@ Use an ordered plan:
 
 The extension advances to the next plan step only after the current step's `verifyCommand` exits 0. After the last step, it runs `finalVerifyCommand` if configured.
 
+## DAG-plan loop spec
+
+For complex features with independent tasks, prefer `mode: "dag-plan"`.
+
+Use dependencies instead of a forced linear order:
+
+```json
+{
+  "name": "onboarding-parallel",
+  "goal": "Implement independent onboarding pieces",
+  "mode": "dag-plan",
+  "parallelism": 2,
+  "maxIterationsPerStep": 3,
+  "trainingMode": true,
+  "plan": [
+    {
+      "id": "draft-applicant",
+      "name": "Creates draft applicant",
+      "dependsOn": [],
+      "taskPrompt": "Write/update the draft applicant test, then implement the smallest behavior needed for it.",
+      "verifyCommand": "npm test -- onboarding.create-draft.test.ts"
+    },
+    {
+      "id": "field-validation",
+      "name": "Validates required fields",
+      "dependsOn": [],
+      "taskPrompt": "Write/update validation tests, then implement the smallest behavior needed for them.",
+      "verifyCommand": "npm test -- onboarding.validation.test.ts"
+    },
+    {
+      "id": "submit-kyc",
+      "name": "Submits to KYC",
+      "dependsOn": ["draft-applicant"],
+      "taskPrompt": "Write/update KYC submit tests, then implement the smallest behavior needed for them.",
+      "verifyCommand": "npm test -- onboarding.kyc-submit.test.ts"
+    }
+  ],
+  "finalVerifyCommand": "npm test -- onboarding"
+}
+```
+
+This is safe pseudo-parallelism: the extension lists ready independent task ids and the agent works on one ready task per iteration. If the agent chooses a ready task other than the suggested one, it must set `loop_report.taskId`.
+
 ## Run a loop
 
 Use:
@@ -96,14 +140,15 @@ During each iteration, the agent must:
 
 The agent does **not** decide completion. After `loop_report`, the extension runs the current verifier:
 
-- exit code `0` → current step is `done`; next step starts or loop completes
-- non-zero exit code → same step continues or hits `maxIterationsPerStep` / `maxIterations`
+- exit code `0` → current step/task is `done`; next eligible work starts or loop completes
+- non-zero exit code → same step/task continues or hits `maxIterationsPerStep` / `maxIterations`
 - `blocked: true` in `loop_report` → loop stops as `blocked`
 
 ## loop_report protocol
 
 Use `loop_report` only to report progress:
 
+- `taskId`: optional; for `dag-plan`, the ready task id worked on this iteration.
 - `summary`: what changed this iteration.
 - `blocked`: true only for human input, missing access, ambiguity, or unsafe action.
 - `nextPrompt`: optional hint for the next iteration if the verifier still fails.
@@ -115,7 +160,7 @@ Never claim completion in `loop_report`; passing the current verifier is the com
 ## Guardrails
 
 - Keep `trainingMode: true` for new loops.
-- Keep `maxIterations` and `maxIterationsPerStep` low until the loop proves useful.
+- Keep `maxIterations`, `maxIterationsPerStep`, and `parallelism` low until the loop proves useful.
 - Prefer specific test commands over broad suites when possible.
 - Break subjective work into sub-loops with an explicit checker or approval gate.
 - Prefer existing specialist skills for execution; the loop orchestrates, tests verify.
