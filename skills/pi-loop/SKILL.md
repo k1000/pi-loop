@@ -7,16 +7,18 @@ description: Design, create, run, and verify deterministic Pi loop-engineering w
 
 Use this skill when turning repeated prompting into a controlled, verifiable Pi loop.
 
-For coding tasks, the core skill is:
+For coding tasks, pair this with the `tdd` skill. The core loop skill is:
 
-> Codify the expected functionality into a suite of tests. Completion verification is the passing test command.
+> Codify expected functionality as behavior tests, one vertical slice at a time. Completion verification is the passing test command.
+
+Do **not** write all tests first and then all implementation. Use TDD tracer bullets: one failing behavior test → minimal implementation → passing verifier → next behavior.
 
 ## Choose the loop shape
 
 - Small task: one loop with one `verifyCommand`.
 - Medium task: one test file/suite, loop until that suite passes.
-- Large sequential feature: `test-plan` mode — ordered test-backed steps, one verifier per step, optional final verifier.
-- Large feature with independent parts: `dag-plan` mode — test-backed tasks with `dependsOn`, ready tasks unlocked by passing verifiers.
+- Large sequential feature: `test-plan` mode — ordered TDD tracer bullets, one verifier per step, optional final verifier.
+- Large feature with independent parts: `dag-plan` mode — independent TDD tracer bullets with `dependsOn`, ready tasks unlocked by passing verifiers.
 - Fuzzy feature: first loop writes the test plan/checker, then stop for human approval.
 
 ## Loopability check
@@ -28,7 +30,7 @@ Before creating or running a loop, confirm:
 3. Extra tokens/time are acceptable.
 4. The loop has the tools/skills needed to run the verifier.
 
-If the expected behavior cannot be tested yet, the first loop goal should be to write the tests or test plan.
+If the expected behavior cannot be tested yet, the first loop goal should be to identify the first behavior test/tracer bullet, not to bulk-write the entire suite.
 
 ## Single-test loop spec
 
@@ -135,7 +137,7 @@ Use:
 During each iteration, the agent must:
 
 1. Do one focused unit of work.
-2. For coding tasks, write/update the test before or alongside the implementation.
+2. For coding tasks, follow the `tdd` skill: write/update one failing behavior test, implement the smallest fix, then let the verifier prove it passes.
 3. End by calling `loop_report` exactly once.
 
 The agent does **not** decide completion. After `loop_report`, the extension runs the current verifier:

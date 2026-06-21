@@ -2,11 +2,13 @@
 
 A small [Pi](https://github.com/earendil-works/pi-coding-agent) extension for deterministic loop engineering.
 
-For coding tasks, the loop's job is simple:
+For coding tasks, pair pi-loop with Pi's `tdd` skill. The loop's job is simple:
 
-> Codify the expected functionality into tests, then loop until the test command passes.
+> Codify expected functionality as behavior tests, one vertical slice at a time, then loop until the test command passes.
 
-For larger features, use a **test plan**: an ordered list of test-backed steps. Pi-loop satisfies one step verifier at a time, advances only when that verifier passes, then optionally runs a final full-suite verifier.
+Avoid bulk-writing all tests first. Prefer TDD tracer bullets: one failing behavior test → minimal implementation → passing verifier → next behavior.
+
+For larger features, use a **test plan**: an ordered list of TDD tracer bullets. Pi-loop satisfies one step verifier at a time, advances only when that verifier passes, then optionally runs a final full-suite verifier.
 
 For features with independent parts, use a **DAG plan**: declare dependencies with `dependsOn`. Pi-loop exposes ready tasks whose dependencies have passed, lets the agent work on one ready task per iteration, and unlocks dependent tasks deterministically.
 
