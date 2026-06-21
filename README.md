@@ -1,8 +1,12 @@
 # pi-loop
 
-A small [Pi](https://github.com/earendil-works/pi-coding-agent) extension for loop engineering: repeat normal agent turns until a clearly defined, verifiable goal is reached.
+A small [Pi](https://github.com/earendil-works/pi-coding-agent) extension for deterministic loop engineering.
 
-The extension does not do the work itself. It orchestrates Pi turns, keeps loop state, asks for training-mode approvals, and requires the agent to report each iteration with a structured `loop_report` tool call.
+For coding tasks, the loop's job is simple:
+
+> Codify the expected functionality into tests, then loop until the test command passes.
+
+The agent does the work. The extension orchestrates normal Pi turns, stores loop state, asks for training-mode approvals, and runs the authoritative verifier after each `loop_report`.
 
 ## Install
 
@@ -41,15 +45,45 @@ The package includes a skill:
 /skill:pi-loop
 ```
 
-Use it to design loop specs, check whether a task is loopable, and make approval criteria deterministic.
+Use it to design deterministic loop specs and turn expected coding functionality into test-based completion criteria.
 
-## Runtime protocol
+## Spec shape
 
-`/loop:run` sends an iteration prompt to the agent. The agent must finish each iteration by calling `loop_report` with:
+```json
+{
+  "name": "fix-login-bug",
+  "goal": "Fix the login bug",
+  "mode": "tdd",
+  "taskPrompt": "First write or update a failing test that proves the login behavior. Then implement the smallest fix. End by calling loop_report.",
+  "verifyCommand": "npm test -- login.test.ts",
+  "doneWhen": "verifyCommand exits 0",
+  "maxIterations": 5,
+  "trainingMode": true
+}
+```
 
-- `status: "done"` — verification proves the definition of done is satisfied.
-- `status: "not_done"` — another iteration should run; include `nextPrompt`.
-- `status: "blocked"` — human input, missing access, ambiguity, or unsafe next step.
+## Deterministic runtime protocol
+
+`/loop:run` sends an iteration prompt to the agent. The agent must finish each iteration by calling `loop_report` with progress only:
+
+```json
+{
+  "summary": "Added login regression test and fixed token parsing.",
+  "blocked": false,
+  "nextPrompt": "If still failing, inspect cookie handling.",
+  "artifacts": ["tests/login.test.ts", "src/auth.ts"]
+}
+```
+
+Then the extension runs `verifyCommand` and decides:
+
+```txt
+exit 0       => done
+exit nonzero => continue, or stop at maxIterations
+blocked true => blocked
+```
+
+The agent no longer decides `done`; passing `verifyCommand` is the completion proof.
 
 Run memory is written by default to:
 
@@ -57,31 +91,12 @@ Run memory is written by default to:
 .pi/loops/runs/<loop-name>/
 ```
 
-## What makes a good loop?
-
-A good loop spec turns vague work into small actions plus deterministic acceptance criteria:
-
-```txt
-Goal: make X true.
-Iteration: do one small step toward X.
-Verification: run/check Y.
-Done: Y passes, returns the expected value, reaches a threshold, or a human approves.
-```
-
-Examples of strong `doneRule` values:
-
-- `npm test exits 0`
-- `pytest tests/foo passes`
-- `curl /health returns HTTP 200`
-- `backtest Sharpe > 1.2 and max drawdown < 10%`
-- `human approval received in training mode`
-
 ## Safety
 
 Every loop spec has:
 
+- `verifyCommand`, the deterministic completion check.
 - `maxIterations`, capped internally at 50.
 - `trainingMode`; keep this `true` until the loop is trusted.
-- `doneRule`; the agent should not report `done` without verification evidence.
 
 For fuzzy goals, add a checker or approval gate, for example `review score >= 8/10` or `human approved`.

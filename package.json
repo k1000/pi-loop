@@ -1,6 +1,6 @@
 {
   "name": "pi-loop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi loop engineering extension: repeat agent turns until a verifiable goal is reached.",
   "type": "module",
   "license": "MIT",
@@ -25,7 +25,6 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.79.9",
     "typebox": "^1.1.38"
   },
   "pi": {
