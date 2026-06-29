@@ -121,6 +121,34 @@ blocked true => blocked
 
 In `dag-plan` mode, the agent may set `tdd_loop_report.taskId` to choose among currently-ready independent tasks. The agent never decides `done`; passing the current verifier is the completion proof.
 
+## Delegated DAG protocol
+
+Delegation is useful for `dag-plan` loops, but the loop verifier remains the source of truth.
+
+Recommended pattern:
+
+1. The main agent decomposes the goal into DAG steps with explicit `dependsOn`, narrow `verifyCommand`s, and expected file ownership in each `taskPrompt`.
+2. The main agent may delegate ready DAG tasks to subagents only when those tasks are independent and file ownership is disjoint.
+3. Each subagent works on one behavior slice: write/update one public-interface behavior test, implement the smallest fix, run the step verifier, and return changed files plus risks.
+4. The main agent reviews/merges the returned work, then calls `tdd_loop_report` for exactly one completed ready task.
+5. The tdd_loop extension runs that task's authoritative verifier and decides whether the task is complete.
+
+Do not let subagents decide loop completion. Do not run parallel implementation agents against the same files, shared schema, migrations, fixtures, or domain service unless the DAG serializes those steps. If several delegated tasks return at once, report them one at a time so each verifier/commit boundary stays auditable.
+
+A delegated DAG step prompt should include this contract:
+
+```txt
+You own only this TDD loop task.
+Allowed file ownership: <paths/globs>.
+Write or update one behavior-focused failing test through the public interface.
+Implement the smallest fix for this behavior only.
+Do not refactor unrelated code or touch files outside ownership; stop and explain if required.
+Run: <verifyCommand>.
+Return: changed files, command result, old-behavior failure rationale, deferred edge cases, and integration risks.
+```
+
+Use low `parallelism` first, typically `2`. Prefer parallel delegation for leaf UI/tests/adapters/docs; serialize core domain services, schema changes, migrations, shared types, and fixtures.
+
 Run memory is written by default to:
 
 ```txt

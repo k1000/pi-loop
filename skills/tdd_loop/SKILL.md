@@ -110,6 +110,32 @@ In `test-plan`, the next step unlocks only after the current step's verifier pas
 
 Never claim completion — passing the verifier is the proof.
 
+## Delegated DAG execution
+
+For large independent work, use `mode: "dag-plan"` and let the main agent act as orchestrator. Delegation is safe only when task ownership is explicit.
+
+Main-agent responsibilities:
+
+- Decompose the goal into DAG steps with narrow `verifyCommand`s.
+- Put expected file ownership / no-touch boundaries in each `taskPrompt`.
+- Delegate only ready DAG tasks whose file ownership is disjoint.
+- Review returned work before reporting.
+- Call `tdd_loop_report` for exactly one completed ready task; the extension verifies and advances.
+
+Subagent contract:
+
+```txt
+You own only this TDD loop task.
+Allowed file ownership: <paths/globs>.
+Write or update one behavior-focused failing test through the public interface.
+Implement the smallest fix for this behavior only.
+Do not refactor unrelated code or touch files outside ownership; stop and explain if required.
+Run: <verifyCommand>.
+Return: changed files, command result, old-behavior failure rationale, deferred edge cases, and integration risks.
+```
+
+Start with `parallelism: 2`. Parallelize leaf UI/tests/adapters/docs. Serialize core domain services, schema, migrations, shared types, fixtures, and any task likely to touch the same files.
+
 ## Guardrails
 
 - Keep `maxIterations`, `maxIterationsPerStep`, and `parallelism` low until the loop proves useful.
