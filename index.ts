@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type, type Static } from "typebox";
+import { Type } from "typebox";
+import type { Static } from "typebox";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -10,16 +11,24 @@ const MAX_SAFE_ITERATIONS = 50;
 const DEFAULT_VERIFY_TIMEOUT_MS = 120_000;
 const DEFAULT_ITERATIONS_PER_STEP = 3;
 
+const TDD_QUALITY_CONTRACT = `
+TDD test-quality contract:
+- Before coding, identify the behavior slice under test and the likely failure modes for this slice: happy path, boundary/empty/invalid input, regression/predictable failure, and ordering/idempotency/concurrency/persistence/permission risks when relevant.
+- Write or update ONE focused behavior test through the public interface. Prefer observable behavior over implementation shape, private methods, or mock choreography.
+- Red phase: run the targeted test before implementation when practical and confirm it fails for the expected reason. If it passes immediately, adjust it or explain why existing coverage already proves the behavior.
+- Green phase: implement the smallest fix for this behavior only. Do not add speculative behavior for future tests.
+- Before reporting, check that the test would fail against the old/broken behavior and mention any relevant edge cases intentionally deferred.
+`;
+
 type LoopStatus = "done" | "not_done" | "blocked";
 type RunStatus = "running" | "done" | "blocked" | "stopped" | "max_iterations";
-type LoopMode = "tdd" | "standard" | "test-plan" | "dag-plan";
+type LoopMode = "tdd" | "test-plan" | "dag-plan";
 
 type LoopStep = {
   id: string;
   name: string;
   taskPrompt: string;
   verifyCommand: string;
-  doneWhen: string;
   dependsOn: string[];
 };
 
@@ -29,15 +38,14 @@ type LoopSpec = {
   mode: LoopMode;
   taskPrompt: string;
   verifyCommand: string;
-  doneWhen: string;
   maxIterations: number;
   maxIterationsPerStep: number;
-  trainingMode: boolean;
   memoryPath?: string;
   verifyTimeoutMs: number;
   plan: LoopStep[];
   finalVerifyCommand?: string;
   parallelism: number;
+  autoCommitEachStep: boolean;
 };
 
 const LoopReportSchema = Type.Object({
@@ -120,7 +128,7 @@ function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-function normalizeStep(raw: unknown, index: number, fallback: Pick<LoopStep, "taskPrompt" | "verifyCommand" | "doneWhen">): LoopStep {
+function normalizeStep(raw: unknown, index: number, fallback: Pick<LoopStep, "taskPrompt" | "verifyCommand">): LoopStep {
   const input = (raw && typeof raw === "object" ? raw : {}) as Partial<LoopStep>;
   const name = String(input.name || `step-${index + 1}`);
   const id = sanitizeName(String(input.id || name || `step-${index + 1}`));
@@ -130,7 +138,6 @@ function normalizeStep(raw: unknown, index: number, fallback: Pick<LoopStep, "ta
     name,
     taskPrompt: String(input.taskPrompt || fallback.taskPrompt),
     verifyCommand: String(input.verifyCommand || fallback.verifyCommand),
-    doneWhen: String(input.doneWhen || fallback.doneWhen),
     dependsOn,
   };
 }
@@ -158,12 +165,11 @@ function normalizeSpec(raw: unknown, fallbackName: string): LoopSpec {
   };
   const name = sanitizeName(String(input.name || fallbackName));
   const fallback = {
-    taskPrompt: String(input.taskPrompt || input.iterationPrompt || "Do one focused iteration toward the goal, then call loop_report."),
+    taskPrompt: String(input.taskPrompt || input.iterationPrompt || "Do one focused iteration toward the goal, then call tdd_loop_report."),
     verifyCommand: String(input.verifyCommand || input.verificationHint || "npm test"),
-    doneWhen: String(input.doneWhen || input.doneRule || "verifyCommand exits 0"),
   };
   const plan = Array.isArray(input.plan) ? input.plan.map((step, index) => normalizeStep(step, index, fallback)) : [];
-  const mode: LoopMode = input.mode === "dag-plan" ? "dag-plan" : input.mode === "test-plan" || plan.length > 0 ? "test-plan" : input.mode === "standard" ? "standard" : "tdd";
+  const mode: LoopMode = input.mode === "dag-plan" ? "dag-plan" : input.mode === "test-plan" || plan.length > 0 ? "test-plan" : "tdd";
   const maxIterationsPerStep = Math.max(
     1,
     Math.min(MAX_SAFE_ITERATIONS, Number.isFinite(input.maxIterationsPerStep) ? Math.floor(Number(input.maxIterationsPerStep)) : DEFAULT_ITERATIONS_PER_STEP),
@@ -175,19 +181,19 @@ function normalizeSpec(raw: unknown, fallbackName: string): LoopSpec {
   );
   const verifyTimeoutMs = Math.max(1_000, Number.isFinite(input.verifyTimeoutMs) ? Math.floor(Number(input.verifyTimeoutMs)) : DEFAULT_VERIFY_TIMEOUT_MS);
   const parallelism = Math.max(1, Math.min(MAX_SAFE_ITERATIONS, Number.isFinite(input.parallelism) ? Math.floor(Number(input.parallelism)) : 1));
+  const autoCommitEachStep = input.autoCommitEachStep !== false;
   return {
     name,
     goal: String(input.goal || "Complete the requested task."),
     mode,
     taskPrompt: fallback.taskPrompt,
     verifyCommand: fallback.verifyCommand,
-    doneWhen: fallback.doneWhen,
     maxIterations,
     maxIterationsPerStep,
-    trainingMode: input.trainingMode !== false,
     verifyTimeoutMs,
     plan,
     parallelism,
+    autoCommitEachStep,
     ...(input.finalVerifyCommand ? { finalVerifyCommand: String(input.finalVerifyCommand) } : {}),
     ...(input.memoryPath ? { memoryPath: String(input.memoryPath) } : {}),
   };
@@ -199,15 +205,14 @@ function defaultSpec(name: string): LoopSpec {
     name: safeName,
     goal: "Describe the concrete goal this loop should finish.",
     mode: "tdd",
-    taskPrompt: "First write or update a failing test that proves the requested behavior. Then implement the smallest fix. End by calling loop_report.",
+    taskPrompt: "First write or update one behavior-focused failing test that proves the requested behavior and its predictable failure mode. Then implement the smallest fix. End by calling tdd_loop_report.",
     verifyCommand: "npm test",
-    doneWhen: "verifyCommand exits 0",
     maxIterations: 5,
     maxIterationsPerStep: DEFAULT_ITERATIONS_PER_STEP,
-    trainingMode: true,
     verifyTimeoutMs: DEFAULT_VERIFY_TIMEOUT_MS,
     plan: [],
     parallelism: 1,
+    autoCommitEachStep: true,
   };
 }
 
@@ -257,10 +262,6 @@ function readyDagSteps(run: ActiveRun) {
   return run.spec.plan.filter((step) => !done.has(step.id) && step.dependsOn.every((dep) => done.has(dep))).slice(0, run.spec.parallelism);
 }
 
-function findStep(run: ActiveRun, id: string) {
-  return run.spec.plan.find((step) => step.id === id);
-}
-
 function selectDagStep(run: ActiveRun, requestedTaskId?: string) {
   const ready = readyDagSteps(run);
   if (requestedTaskId) {
@@ -286,7 +287,6 @@ function currentStep(run: ActiveRun): LoopStep {
     name: "single-step",
     taskPrompt: run.spec.taskPrompt,
     verifyCommand: run.spec.verifyCommand,
-    doneWhen: run.spec.doneWhen,
     dependsOn: [],
   };
 }
@@ -336,13 +336,14 @@ function buildIterationPrompt(run: ActiveRun, promptOverride?: string) {
   const prompt = promptOverride?.trim() || step.taskPrompt;
   const ready = isDagPlan(run) ? readyDagSteps(run) : [];
   const dagInstructions = isDagPlan(run)
-    ? `\nDAG mode:\n- Independent ready tasks may be implemented in any safe order.\n- Work on exactly one ready task in this iteration. Suggested task: ${step.id}.\n- If you choose a different ready task, set loop_report.taskId to that task id.\n- Ready task ids: ${ready.map((s) => s.id).join(", ") || "none"}.\n`
+    ? `\nDAG mode:\n- Independent ready tasks may be implemented in any safe order.\n- Work on exactly one ready task in this iteration. Suggested task: ${step.id}.\n- If you choose a different ready task, set tdd_loop_report.taskId to that task id.\n- Ready task ids: ${ready.map((s) => s.id).join(", ") || "none"}.\n`
     : "";
   const tdd = run.spec.mode === "tdd" || run.spec.mode === "test-plan" || run.spec.mode === "dag-plan"
-    ? "\nTDD mode:\n- Codify the expected functionality into tests.\n- For this iteration, satisfy the current test-backed step only.\n- Completion verification is the authoritative test command passing.\n"
+    ? `\nTDD mode:\n- Codify the expected functionality into tests.\n- For this iteration, satisfy the current test-backed step only.\n- Completion verification is the authoritative test command passing.\n${TDD_QUALITY_CONTRACT}`
     : "";
   const plan = formatPlan(run);
-  return `You are running Pi loop \"${run.spec.name}\".\n\nGoal:\n${run.spec.goal}\n\nCurrent step:\n${currentStepLabel(run)}\n\nDone when for current step:\n${step.doneWhen}\n\nAuthoritative verifier for current step:\n${step.verifyCommand}\n\nTotal iteration ${run.iteration} of ${run.spec.maxIterations}. Step iteration ${run.stepIteration} of ${run.spec.maxIterationsPerStep}.\n${plan}${dagInstructions}${tdd}\nPrevious loop history:\n${formatHistory(run)}\n\nThis iteration prompt:\n${prompt}\n\nLoop protocol:\n- Do one focused iteration only.\n- Use available execution skills/tools as needed.\n- You may run checks while working, but final step completion is decided by the extension running the authoritative verifier after your report.\n- End by calling loop_report exactly once.\n- Set blocked=true only if progress requires human input, missing access, ambiguity, or an unsafe action.\n- If not blocked, include nextPrompt only when you have a useful hint for a possible next iteration.\n- In test-plan mode, the extension advances to the next test step only after the current step verifier passes.\n- In dag-plan mode, the extension marks the reported ready task done after its verifier passes and unlocks dependent tasks.`;
+  return `You are running Pi loop \"${run.spec.name}\".\n\nGoal:\n${run.spec.goal}\n\nCurrent step:\n${currentStepLabel(run)}\n\nAuthoritative verifier for current step:\n${step.verifyCommand}\n\nTotal iteration ${run.iteration} of ${run.spec.maxIterations}. Step iteration ${run.stepIteration} of ${run.spec.maxIterationsPerStep}.\n${plan}${dagInstructions}${tdd}\nPrevious loop history:\n${formatHistory(run)}\n\nThis iteration prompt:\n${prompt}\n\nLoop protocol:\n- Do one focused iteration only.\n- Use available execution skills/tools as needed.\n- You may run checks while working, but final step completion is decided by the extension running the authoritative verifier after your report.\n- End by calling tdd_loop_report exactly once.\n- Set blocked=true only if progress requires human input, missing access, ambiguity, or an unsafe action.\n- If not blocked, include nextPrompt only when you have a useful hint for a possible next iteration.\n- In test-plan mode, the extension advances to the next test step only after the current step verifier passes.\n- In dag-plan mode, the extension marks the reported ready task done after its verifier passes and unlocks dependent tasks.
+- By default, the extension creates a local git commit after each completed step when there are working-tree changes. Set autoCommitEachStep=false in the loop spec to opt out.`;
 }
 
 function statusText(run?: ActiveRun) {
@@ -351,14 +352,14 @@ function statusText(run?: ActiveRun) {
 }
 
 function updateUi(ctx: { ui?: { setStatus?: (key: string, value?: string) => void; setWidget?: (key: string, value?: string[] | undefined) => void } }, run?: ActiveRun) {
-  ctx.ui?.setStatus?.("pi-loop", run ? statusText(run) : undefined);
+  ctx.ui?.setStatus?.("tdd_loop", run ? statusText(run) : undefined);
   if (!run) {
-    ctx.ui?.setWidget?.("pi-loop", undefined);
+    ctx.ui?.setWidget?.("tdd_loop", undefined);
     return;
   }
   const step = currentStep(run);
   const last = run.history.at(-1);
-  ctx.ui?.setWidget?.("pi-loop", [
+  ctx.ui?.setWidget?.("tdd_loop", [
     `↻ Loop: ${run.spec.name} (${run.status}, ${currentStepLabel(run)})`,
     `Verifier: ${step.verifyCommand}`,
     last ? `Last: ${last.status} — ${last.verification}` : "Last: not started",
@@ -393,7 +394,7 @@ function startRun(cwd: string, spec: LoopSpec, specPath: string): ActiveRun {
   writeJson(runPath, run);
   appendFileSync(
     logPath,
-    `# Loop run: ${spec.name}\n\n- Run ID: ${runId}\n- Started: ${startedAt}\n- Goal: ${spec.goal}\n- Mode: ${spec.mode}\n- Current step: ${currentStepLabel(run)}\n- Done when: ${step.doneWhen}\n- Verifier: ${step.verifyCommand}\n- Parallelism: ${spec.parallelism}\n- Final verifier: ${spec.finalVerifyCommand || "none"}\n- Spec: ${specPath}\n`,
+    `# Loop run: ${spec.name}\n\n- Run ID: ${runId}\n- Started: ${startedAt}\n- Goal: ${spec.goal}\n- Mode: ${spec.mode}\n- Current step: ${currentStepLabel(run)}\n- Verifier: ${step.verifyCommand}\n- Parallelism: ${spec.parallelism}\n- Final verifier: ${spec.finalVerifyCommand || "none"}\n- Spec: ${specPath}\n`,
     "utf8",
   );
   return run;
@@ -418,12 +419,27 @@ export default function piLoop(pi: ExtensionAPI) {
 
   async function runVerifier(run: ActiveRun, signal: AbortSignal | undefined, command = currentStep(run).verifyCommand) {
     const shellCommand = `cd ${shellQuote(run.cwd)} && ${command}`;
-    const result = await pi.exec("bash", ["-lc", shellCommand], { signal, timeout: run.spec.verifyTimeoutMs } as any) as any;
+    const result: { code?: number; stdout?: string; stderr?: string; killed?: boolean } = await pi.exec("bash", ["-lc", shellCommand], { signal, timeout: run.spec.verifyTimeoutMs });
     const exitCode = typeof result.code === "number" ? result.code : null;
     const stdout = trunc(result.stdout);
     const stderr = trunc(result.stderr);
     const verification = `\`${command}\` exited ${exitCode}${result.killed ? " (killed/timeout)" : ""}`;
     return { command, exitCode, stdout, stderr, verification };
+  }
+
+  async function autoCommitStep(run: ActiveRun, signal: AbortSignal | undefined, entry: HistoryEntry) {
+    if (!run.spec.autoCommitEachStep) return;
+    if (entry.status !== "done") return;
+    const stepName = entry.stepId ? `${entry.stepId}` : entry.stepName || "step";
+    const message = `tdd-loop(${run.spec.name}): step ${stepName} passed`;
+    const command = [
+      "if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo 'Not inside a git work tree; skipping tdd-loop auto-commit.'; exit 0; fi",
+      "if [ -z \"$(git status --porcelain)\" ]; then echo 'No changes to commit.'; exit 0; fi",
+      "git add -A",
+      `git commit --no-verify -m ${shellQuote(message)}`,
+    ].join(" && ");
+    const shellCommand = `cd ${shellQuote(run.cwd)} && ${command}`;
+    await pi.exec("bash", ["-lc", shellCommand], { signal, timeout: run.spec.verifyTimeoutMs });
   }
 
   function makeEntry(run: ActiveRun, report: LoopReport, status: LoopStatus, verification: Awaited<ReturnType<typeof runVerifier>>, step = currentStep(run)): HistoryEntry {
@@ -459,11 +475,6 @@ export default function piLoop(pi: ExtensionAPI) {
     };
   }
 
-  async function maybeConfirmContinue(ctx: any, title: string, body: string) {
-    if (!activeRun?.spec.trainingMode || !ctx.hasUI) return true;
-    return await ctx.ui.confirm(title, body);
-  }
-
   async function handleNew(args: string, ctx: any) {
     let name = sanitizeName(args || "");
     if (!name && ctx.hasUI) {
@@ -471,7 +482,7 @@ export default function piLoop(pi: ExtensionAPI) {
       name = sanitizeName(answer || "");
     }
     if (!name) {
-      ctx.ui.notify("Usage: /loop:new <name>", "warning");
+      ctx.ui.notify("Usage: /tdd_loop:new <name>", "warning");
       return;
     }
 
@@ -499,11 +510,11 @@ export default function piLoop(pi: ExtensionAPI) {
   async function handleRun(args: string, ctx: any) {
     const specArg = args.trim();
     if (!specArg) {
-      ctx.ui.notify("Usage: /loop:run <name-or-path>", "warning");
+      ctx.ui.notify("Usage: /tdd_loop:run <name-or-path>", "warning");
       return;
     }
     if (activeRun?.status === "running") {
-      ctx.ui.notify(`A loop is already running: ${activeRun.spec.name}. Use /loop:stop first.`, "warning");
+      ctx.ui.notify(`A loop is already running: ${activeRun.spec.name}. Use /tdd_loop:stop first.`, "warning");
       return;
     }
     const { spec, path } = loadSpec(ctx.cwd, specArg);
@@ -523,19 +534,6 @@ export default function piLoop(pi: ExtensionAPI) {
     updateUi(ctx, activeRun);
     ctx.ui.notify(`Started loop ${spec.name} (${activeRun.runId})`, "info");
     await queueNext(activeRun, currentStep(activeRun).taskPrompt);
-  }
-
-  async function handleStatus(_args: string, ctx: any) {
-    if (!activeRun) {
-      ctx.ui.notify("No active loop.", "info");
-      return;
-    }
-    updateUi(ctx, activeRun);
-    const last = activeRun.history.at(-1);
-    ctx.ui.notify(
-      `${statusText(activeRun)}\nRun file: ${activeRun.runPath}\nVerifier: ${currentStep(activeRun).verifyCommand}\n${last ? `Last report: ${last.status} — ${last.verification}` : "No reports yet."}`,
-      "info",
-    );
   }
 
   async function handleStop(_args: string, ctx: any) {
@@ -563,38 +561,36 @@ export default function piLoop(pi: ExtensionAPI) {
     });
   }
 
-  pi.registerCommand("loop", {
-    description: "Loop engineering orchestrator. Usage: /loop new|run|status|stop ...",
+  pi.registerCommand("tdd_loop", {
+    description: "TDD loop engineering orchestrator. Usage: /tdd_loop new|run|stop ...",
     handler: async (args, ctx) => {
       const [subcommandRaw, ...rest] = args.trim().split(/\s+/);
-      const subcommand = (subcommandRaw || "status").toLowerCase();
+      const subcommand = subcommandRaw?.toLowerCase();
       const subArgs = rest.join(" ");
       try {
         if (subcommand === "new") return await handleNew(subArgs, ctx);
         if (subcommand === "run") return await handleRun(subArgs, ctx);
-        if (subcommand === "status") return await handleStatus(subArgs, ctx);
         if (subcommand === "stop") return await handleStop(subArgs, ctx);
-        ctx.ui.notify("Usage: /loop new|run|status|stop ...", "warning");
+        ctx.ui.notify("Usage: /tdd_loop new|run|stop ...", "warning");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
     },
   });
 
-  registerLoopAlias("loop:new", handleNew);
-  registerLoopAlias("loop:run", handleRun);
-  registerLoopAlias("loop:status", handleStatus);
-  registerLoopAlias("loop:stop", handleStop);
+  registerLoopAlias("tdd_loop:new", handleNew);
+  registerLoopAlias("tdd_loop:run", handleRun);
+  registerLoopAlias("tdd_loop:stop", handleStop);
 
   pi.registerTool({
-    name: "loop_report",
-    label: "Loop Report",
+    name: "tdd_loop_report",
+    label: "TDD Loop Report",
     description: "Report one loop iteration to the Pi loop orchestrator. The extension then runs the current step verifier and decides progress deterministically.",
-    promptSnippet: "Report loop iteration progress; pi-loop runs the current verifier to decide completion",
+    promptSnippet: "Report loop iteration progress; tdd_loop runs the current verifier to decide completion",
     promptGuidelines: [
-      "Use loop_report exactly once at the end of a Pi loop iteration when a /loop:run prompt asks for it.",
-      "Do not claim loop completion in loop_report; pi-loop decides completion by running the current verifyCommand.",
-      "Set loop_report blocked=true only when progress requires human input, missing access, ambiguity, or an unsafe action.",
+      "Use tdd_loop_report exactly once at the end of a Pi loop iteration when a /tdd_loop:run prompt asks for it.",
+      "Do not claim loop completion in tdd_loop_report; tdd_loop decides completion by running the current verifyCommand.",
+      "Set tdd_loop_report blocked=true only when progress requires human input, missing access, ambiguity, or an unsafe action.",
     ],
     parameters: LoopReportSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -628,6 +624,7 @@ export default function piLoop(pi: ExtensionAPI) {
         };
         activeRun.history.push(entry);
         appendRunLog(activeRun, entry);
+        persistRun(activeRun);
         return stopRun(ctx, "blocked", "Loop blocked.", { accepted: true, finalStatus: "blocked" });
       }
 
@@ -636,6 +633,9 @@ export default function piLoop(pi: ExtensionAPI) {
       const entry = makeEntry(activeRun, report, status, verification, step);
       activeRun.history.push(entry);
       appendRunLog(activeRun, entry);
+      persistRun(activeRun);
+
+      if (status === "done") await autoCommitStep(activeRun, signal, entry);
 
       if (status === "done" && isDagPlan(activeRun)) {
         if (!activeRun.completedTaskIds.includes(step.id)) activeRun.completedTaskIds.push(step.id);
@@ -646,12 +646,6 @@ export default function piLoop(pi: ExtensionAPI) {
           persistRun(activeRun);
           updateUi(ctx, activeRun);
           const nextStep = currentStep(activeRun);
-          const ok = await maybeConfirmContinue(
-            ctx,
-            `Continue loop ${activeRun.spec.name}?`,
-            `Completed DAG task ${step.id}.\n\nNext ready task: ${currentStepLabel(activeRun)}\nVerifier: ${nextStep.verifyCommand}`,
-          );
-          if (!ok) return stopRun(ctx, "stopped", "Loop paused by user.", { accepted: true, finalStatus: "stopped", verification });
           await queueNext(activeRun, nextStep.taskPrompt);
           return {
             content: [{ type: "text", text: `DAG task verifier passed; queued ready task ${currentStepLabel(activeRun)}.` }],
@@ -669,12 +663,6 @@ export default function piLoop(pi: ExtensionAPI) {
         persistRun(activeRun);
         updateUi(ctx, activeRun);
         const nextStep = currentStep(activeRun);
-        const ok = await maybeConfirmContinue(
-          ctx,
-          `Continue loop ${activeRun.spec.name}?`,
-          `Completed ${completedStep}.\n\nNext step: ${currentStepLabel(activeRun)}\nVerifier: ${nextStep.verifyCommand}`,
-        );
-        if (!ok) return stopRun(ctx, "stopped", "Loop paused by user.", { accepted: true, finalStatus: "stopped", verification });
         await queueNext(activeRun, nextStep.taskPrompt);
         return {
           content: [{ type: "text", text: `Step verifier passed; queued next test step ${currentStepLabel(activeRun)}.` }],
@@ -691,12 +679,12 @@ export default function piLoop(pi: ExtensionAPI) {
           name: "final-verifier",
           taskPrompt: "Final verification",
           verifyCommand: activeRun.spec.finalVerifyCommand,
-          doneWhen: "finalVerifyCommand exits 0",
           dependsOn: [],
         });
         activeRun.history.push(finalEntry);
         appendRunLog(activeRun, finalEntry);
         if (finalStatus === "done") {
+          await autoCommitStep(activeRun, signal, finalEntry);
           return stopRun(ctx, "done", "Loop complete: final verifier passed.", { accepted: true, finalStatus: "done", verification: finalVerification });
         }
         if (activeRun.iteration >= activeRun.spec.maxIterations || activeRun.stepIteration >= activeRun.spec.maxIterationsPerStep) {
@@ -706,13 +694,7 @@ export default function piLoop(pi: ExtensionAPI) {
         activeRun.stepIteration += 1;
         persistRun(activeRun);
         updateUi(ctx, activeRun);
-        const finalPrompt = report.nextPrompt?.trim() || `All planned step tests passed, but the final verifier failed: ${activeRun.spec.finalVerifyCommand}. Fix integration/regression failures while preserving the passing step tests, then call loop_report.`;
-        const ok = await maybeConfirmContinue(
-          ctx,
-          `Continue loop ${activeRun.spec.name}?`,
-          `Final verifier failed: ${finalVerification.verification}\n\nNext iteration: ${activeRun.iteration}/${activeRun.spec.maxIterations}`,
-        );
-        if (!ok) return stopRun(ctx, "stopped", "Loop paused by user.", { accepted: true, finalStatus: "stopped", verification: finalVerification });
+        const finalPrompt = report.nextPrompt?.trim() || `All planned step tests passed, but the final verifier failed: ${activeRun.spec.finalVerifyCommand}. Fix integration/regression failures while preserving the passing step tests, then call tdd_loop_report.`;
         await queueNext(activeRun, finalPrompt);
         return {
           content: [{ type: "text", text: `Final verifier failed; queued loop iteration ${activeRun.iteration}/${activeRun.spec.maxIterations}.` }],
@@ -734,13 +716,6 @@ export default function piLoop(pi: ExtensionAPI) {
       activeRun.stepIteration += 1;
       persistRun(activeRun);
       updateUi(ctx, activeRun);
-
-      const ok = await maybeConfirmContinue(
-        ctx,
-        `Continue loop ${activeRun.spec.name}?`,
-        `Next iteration: ${activeRun.iteration}/${activeRun.spec.maxIterations}\nStep iteration: ${activeRun.stepIteration}/${activeRun.spec.maxIterationsPerStep}\n\nVerifier failed: ${verification.verification}\n\nLast summary: ${report.summary}`,
-      );
-      if (!ok) return stopRun(ctx, "stopped", "Loop paused by user.", { accepted: true, finalStatus: "stopped", verification });
 
       await queueNext(activeRun, nextPrompt);
       return {

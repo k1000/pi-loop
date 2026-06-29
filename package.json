@@ -1,7 +1,7 @@
 {
-  "name": "pi-loop",
-  "version": "0.4.0",
-  "description": "Pi loop engineering extension: repeat agent turns until a verifiable goal is reached.",
+  "name": "tdd_loop",
+  "version": "0.5.1",
+  "description": "TDD loop engineering extension: repeat agent turns until a verifiable goal is reached.",
   "type": "module",
   "license": "MIT",
   "author": "k1000",
@@ -10,17 +10,17 @@
     "pi-coding-agent",
     "pi-extension",
     "agent-skills",
-    "loop-engineering",
+    "tdd-loop-engineering",
     "automation"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/k1000/pi-loop.git"
+    "url": "git+https://github.com/k1000/tdd_loop.git"
   },
   "bugs": {
-    "url": "https://github.com/k1000/pi-loop/issues"
+    "url": "https://github.com/k1000/tdd_loop/issues"
   },
-  "homepage": "https://github.com/k1000/pi-loop#readme",
+  "homepage": "https://github.com/k1000/tdd_loop#readme",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
