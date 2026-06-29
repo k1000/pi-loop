@@ -73,8 +73,9 @@ Drop `dependsOn` and set `mode: "test-plan"` for the same shape run strictly in 
 ## Create and run
 
 ```txt
-/tdd_loop:new <name>          # writes .pi/loops/specs/<name>.json
-/tdd_loop:run <name-or-path>  # starts a run
+/tdd_loop:new <name>              # writes .pi/loops/specs/<name>.json
+/tdd_loop:run <name-or-path>      # starts a run
+/tdd_loop:resume <run-path-name>  # resume a saved/interrupted run
 ```
 
 Each iteration: do one focused unit of work (write/update one failing behavior test → smallest fix per the `tdd` skill), then call `tdd_loop_report` **exactly once**.
@@ -136,6 +137,22 @@ Return: changed files, command result, old-behavior failure rationale, deferred 
 
 Start with `parallelism: 2`. Parallelize leaf UI/tests/adapters/docs. Serialize core domain services, schema, migrations, shared types, fixtures, and any task likely to touch the same files.
 
+## Stop
+
+```txt
+/tdd_loop:stop
+```
+
+## Resume
+
+If Pi is interrupted or restarted mid-loop, the run state is still on disk at `.pi/loops/runs/<name>/`. Continue with:
+
+```txt
+/tdd_loop:resume fix-login-bug
+```
+
+Provide the loop name to pick up the most recent run, or an absolute path to a specific run JSON. The extension rehydrates the state and queues the current step.
+
 ## Guardrails
 
 - Keep `maxIterations`, `maxIterationsPerStep`, and `parallelism` low until the loop proves useful.
@@ -143,12 +160,15 @@ Start with `parallelism: 2`. Parallelize leaf UI/tests/adapters/docs. Serialize 
 - Break subjective work into sub-loops with an explicit checker or approval gate.
 - Prefer specialist skills for execution; the loop orchestrates, tests verify.
 
-## Stop
+### Built-in safety
 
-```txt
-/tdd_loop:stop
-```
+- **DAG cycle detection**: dependency cycles are detected at startup and rejected with a clear error message.
+- **Vacuous pass guard**: set `verifyOutputPattern` to a regex that must match verifier output. Exit 0 without matching output counts as failure.
+- **Dirty-tree warning**: warns before starting if the working tree has pre-existing uncommitted changes.
+- **Abort safety**: cancelled verifier runs preserve loop state without advancing or committing.
+- **History truncation**: prompts show the last 10 iterations to bound token usage.
+- **`autoCommitNoVerify`**: defaults to `false` (respects pre-commit hooks). Set `true` to bypass hooks.
+- **`autoCommitAddUntracked`**: defaults to `false` (stages tracked changes only). Set `true` to use `git add -A` and include untracked files.
+- **`autoCommitEachStep`**: defaults to `true`. Creates a local git commit after each completed step. Set `false` to opt out.
 
 Run memory is written to `.pi/loops/runs/<name>/` (a `.json` state file + a `.md` log per run). Live status shows in the Pi UI widget.
-
-Default behavior: after each completed step, tdd_loop creates a local git commit when the working tree has changes. Failed iterations are not committed. Set `"autoCommitEachStep": false` in an individual loop spec to opt out.

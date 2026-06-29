@@ -27,15 +27,16 @@ Then restart Pi or run:
 ## Commands
 
 ```txt
-/tdd_loop:new <name>          # create .pi/loops/specs/<name>.json
-/tdd_loop:run <name-or-path>  # start a loop run
-/tdd_loop:stop                # stop active loop
+/tdd_loop:new <name>              # create .pi/loops/specs/<name>.json
+/tdd_loop:run <name-or-path>      # start a loop run
+/tdd_loop:stop                    # stop active loop
+/tdd_loop:resume <run-path-name>  # resume a saved/interrupted loop run
 ```
 
 You can also use:
 
 ```txt
-/tdd_loop new|run|stop ...
+/tdd_loop new|run|stop|resume ...
 ```
 
 The Pi UI widget shows live status while a loop runs.
@@ -157,14 +158,61 @@ Run memory is written by default to:
 
 By default, each completed step creates a local git commit when the working tree has changes. Failed iterations are not committed. Set `"autoCommitEachStep": false` in a loop spec to opt out for that loop.
 
-## Safety
+## Resume a run
 
-Every loop spec has:
+If Pi is interrupted or restarted mid-loop, the run state is saved to `.pi/loops/runs/<name>/`. To continue:
 
-- `verifyCommand` or a test-backed `plan`.
+```txt
+/tdd_loop:resume <run-path-or-name>
+```
+
+Provide the absolute path to the run JSON file, or just the loop name to pick up the most recent run:
+
+```txt
+/tdd_loop:resume fix-login-bug
+```
+
+The extension rehydrates the run state, marks it running, and queues the current step.
+
+## Spec fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | (required) | Unique spec name, used for file naming |
+| `goal` | string | `"Complete the requested task."` | Description of what the loop should achieve |
+| `mode` | `"tdd"` \| `"test-plan"` \| `"dag-plan"` | inferred | Loop shape (see table above) |
+| `taskPrompt` | string | — | Instruction for each iteration |
+| `verifyCommand` | string | `"npm test"` | Shell command that proves completion |
+| `maxIterations` | number | 5 (tdd), computed (plan) | Max total iterations, capped at 50 |
+| `maxIterationsPerStep` | number | 3 | Max attempts per step/plan task |
+| `verifyTimeoutMs` | number | 120000 | Timeout per verify command run |
+| `plan` | array | `[]` | Steps for test-plan or dag-plan modes |
+| `finalVerifyCommand` | string | — | Full-suite check after all plan steps pass |
+| `parallelism` | number | 1 | How many ready DAG tasks to surface (does not auto-parallelize) |
+| `autoCommitEachStep` | boolean | `true` | Create a local git commit after each completed step |
+| `autoCommitNoVerify` | boolean | `false` | Use `git commit --no-verify` (bypasses pre-commit hooks) |
+| `autoCommitAddUntracked` | boolean | `false` | Use `git add -A` instead of `git add -u` (stages untracked/new files too). Off by default for safety. |
+| `verifyOutputPattern` | string | — | Regex pattern that must match verifier output (stdout+stderr) for exit 0 to count as "done". Prevents vacuous passes from empty test suites. |
+| `verifyPrefix` | string | — | Required prefix for `verifyCommand` (e.g., `"npm test"`). Commands not starting with this prefix are rejected at startup. Lightweight sandbox for shared specs. |
+
+### Safety guarantees
+
 - `dependsOn` for DAG tasks that must wait for other tests to pass.
-- `maxIterations`, capped internally at 50.
+- **DAG cycle detection**: loops with dependency cycles are rejected at startup with a clear error message.
+- **Vacuous pass guard**: set `verifyOutputPattern` to a regex that must match verifier output. Exit 0 without matching output counts as failure — prevents empty test suites from passing.
+- **Dirty-tree warning**: warns before starting if the working tree has pre-existing uncommitted changes that would be swept into auto-commits.
+- **Abort safety**: if the verifier is cancelled mid-run, loop state is preserved without committing or advancing.
+- `maxIterations` capped internally at 50.
 - `maxIterationsPerStep` for test/DAG plans.
-- `autoCommitEachStep`, defaulting to `true`, to create a local commit after each completed step when changes exist.
+- `autoCommitEachStep`, defaulting to `true`, to create a local commit after each completed step when changes exist. By default pre-commit hooks are respected; set `autoCommitNoVerify: true` to bypass them.
+- **History truncation**: prompts show the last 10 iterations to keep token usage bounded for long runs.
+- **Duplicate task guard**: reporting an already-completed DAG task ID is safely rejected.
+- **Final verifier cap**: the final verifier (`finalVerifyCommand`) uses a dedicated attempt counter (`maxIterationsPerStep`), separate from the step iteration budget.
+- **Atomic writes**: all state files are written via temp file + rename to prevent corruption from interrupted writes.
+- **Command prefix guard**: set `verifyPrefix` to lock `verifyCommand` to a specific tool (e.g., `"npm test"`). Rejected at startup if the command doesn't match.
+- **Dangerous command blocklist**: commands like `rm -rf`, `dd`, `mkfs`, `sudo` are blocked by default. Removable from source if intentionally needed.
+- **TOCTOU race prevention**: the run slot is claimed synchronously before any async operation, preventing concurrent /tdd_loop:run calls from racing.
+- **`git add -u` by default**: auto-commit only stages tracked file changes (safe default). Set `autoCommitAddUntracked: true` for `git add -A` if new files are expected.
+- **Unknown field detection**: misspelled or unknown fields in spec JSON are detected at parse time with a clear `console.warn` message, preventing silent configurability errors.
 
 For fuzzy goals, first create a test plan or add a checker/approval gate, for example `review score >= 8/10` or `human approved`.
